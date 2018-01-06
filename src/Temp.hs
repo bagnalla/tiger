@@ -4,6 +4,7 @@ module Temp (
   namedLabel,
   newLabel,
   newTemp,
+  tempConst,
   Temp
   ) where
 
@@ -23,11 +24,14 @@ newTemp _ = do
   n <- nextNum
   return $ Temp (show n)
 
+tempConst :: String -> Temp
+tempConst = Temp
+
 makeString :: Temp -> String
 makeString _ = ""
 
 data Label = Label String
-  deriving (Show)
+  deriving (Eq, Show)
 
 newLabel :: (Num s, Show s, MonadState s m) => unit -> m Label
 newLabel _ = do

@@ -6,7 +6,8 @@ module X64Frame (
   ) where
 
 import Frame (Frame(..))
-import Temp (Label(..))
+import Temp (Label(..), tempConst)
+import Tree (Binop(..), Exp(..))
 
 data X64Access =
   X64InFrame Int
@@ -36,7 +37,15 @@ data X64Frame =
 x64ViewShift = [X64Push (X64InReg "bp"),
                 X64Mov  (X64InReg "sp") (X64InReg "bp")]
 
+x64fp = tempConst "fp"
+
 x64WordSize = 8
+
+x64Exp :: X64Access -> Exp -> Exp
+x64Exp a e =
+  case a of
+    X64InFrame i -> EMem (EBinop BPlus e (EConst i))
+    X64InReg   s -> ETemp (tempConst s)
 
 instance Frame X64Frame where
   type Access X64Frame = X64Access
@@ -49,4 +58,6 @@ instance Frame X64Frame where
   name           = x64frame_label
   formals        = x64frame_formals
   allocLocal f b = X64InFrame 0
+  fp _           = x64fp
   wordSize _     = x64WordSize
+  exp a          = x64Exp

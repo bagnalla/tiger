@@ -10,7 +10,7 @@ import Control.Monad.Identity
 import Control.Monad.Reader
 import Control.Monad.State
 
-import Data.List (find, nub)
+import Data.List (find, findIndex, nub)
 import Data.Maybe (fromJust)
 
 import qualified Absyn as A
@@ -19,14 +19,15 @@ import           Absyn (Array(..), Assign(..), Dec(..), Call(..), Exp(..),
                         Op(..), Oper(..), Pos, Record(..), Symbol, TyDec(..),
                         Var(..), VDec(..), While(..))
 import           Env (base_tenv, base_venv, EnvEntry(..), FEntry(..),
-                      getFunEntry, getVarTy, TypeEnv, ValueEnv, VEntry(..))
+                      getFunEntry, getVarAccess, getVarEntry, getVarTy,
+                      TypeEnv, ValueEnv, VEntry(..))
 import           Frame (Frame)
 import           Gensym (nextNum)
 import           Symtab as S (add, empty, get)
 import           Temp (makeString, newLabel, Label)
 import qualified Translate as T (dummyExp, Exp, outermost)
-import           Translate (Access, allocLocal, Level, newLevel)
--- import qualified Tree (Exp(..))
+import           Translate (Access, allocLocal, fieldVar, Level, newLevel,
+                            simpleVar, subscriptVar)
 import           Types (fixTys, isNil, showTy, Ty(..))
 
 data ExpTy = ExpTy
@@ -92,29 +93,46 @@ isVarAssigned _ _ = False
 ------------------
 -- Typecheck Vars
 
-transVar :: Var -> TransM ExpTy b
+transVar :: Frame b => Var -> TransM ExpTy b
 
 transVar (SimpleVar sym pos) = do 
-  (_, venv, _, _) <- ask
-  case getVarTy sym venv of
-    Just ty -> return ExpTy { expty_exp = T.dummyExp, expty_ty = ty }
+  (_, venv, _, lvl) <- ask
+  case getVarEntry sym venv of
+    Just ventry ->
+      -- The ventry access contains the level of where the var is
+      -- declared, and lvl is the level here where it's being
+      -- used. simpleVar compares these to generate the correct IR
+      -- code for accessing the var (following static links if
+      -- necessary).
+      return ExpTy { expty_exp = simpleVar (ventry_access ventry) lvl,
+                     expty_ty = ventry_ty ventry }
     _       -> raise "unbound variable identifier" pos
 
 transVar (FieldVar var sym pos) = do
+  (_, _, _, lvl) <- ask
   var' <- transVar var
   case (expty_ty var') of
     RecordTy fieldTys _ ->
         case find (\x -> fst x == sym) fieldTys of
-          Just (sym, ty) -> return ExpTy { expty_exp = T.dummyExp,
-                                           expty_ty = ty }
+          Just (sym, ty) ->
+            -- Get index of the field
+            case findIndex ((== sym) . fst) fieldTys of
+              Just i -> do
+                exp <- fieldVar lvl (expty_exp var') i
+                return ExpTy { expty_exp = exp,
+                               expty_ty = ty }
+              _          -> raise "impossible" pos
           Nothing        -> raise "field doesn't exist" pos
     _ -> raise "expected record type" pos
 
-transVar (SubscriptVar var exp pos) = do
-  var' <- transVar var  
+transVar (SubscriptVar var i_exp pos) = do
+  var'   <- transVar var -- The array variable
+  i_exp' <- assertExpTy i_exp IntTy pos
   case (expty_ty var') of
-    ArrayTy ty _ ->
-      return ExpTy { expty_exp = T.dummyExp,
+    ArrayTy ty _ -> do
+      (_, _, _, lvl) <- ask
+      exp <- subscriptVar lvl (expty_exp var') (expty_exp i_exp')
+      return ExpTy { expty_exp = exp,
                      expty_ty = ty }
     _ -> raise "expected array type" pos
 
@@ -278,7 +296,9 @@ transDec (FunctionDec fundecs) =
   else do
     (tenv, venv, b, lvl) <- ask
     labels <- mapM (\_ -> newLabel ()) fundecs
-    let levels = map (\(f, lbl) -> mkLevel lvl lbl f) (zip fundecs labels)
+    -- ids    <- mapM (\_ -> nextNum) fundecs
+    let levels = map (\(f, lbl) -> mkLevel lvl lbl f)
+          (zip fundecs labels)
     -- Build function entries
     headers <- mapM (\(f, lvl, lbl) -> mkHeader lvl lbl f)
       (zip3 fundecs levels labels)
@@ -289,13 +309,12 @@ transDec (FunctionDec fundecs) =
     -- Typecheck function bodies
     local (const (tenv, venv', b, lvl))
       (mapM (\(f, lvl) -> h f lvl) (zip fundecs levels))
-    -- Return the extended context
+    -- Return the extended coxntext
     return (tenv, venv', b, lvl)
     
       -- Make header from a fundec
       where mkLevel lvl lbl fdec = do
-              newLevel lvl lbl
-                [True | _ <- fun_params fdec]
+              newLevel lvl lbl [True | _ <- fun_params fdec]
             mkHeader lvl lbl fdec = do
               param_tys <- mapM g (fun_params fdec)
               result_ty <- case (fun_result fdec) of

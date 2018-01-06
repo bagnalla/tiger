@@ -4,6 +4,8 @@ module Env (
   EnvEntry(..),
   FEntry(..),
   getFunEntry,
+  getVarAccess,
+  getVarEntry,
   getVarTy,
   TypeEnv,
   ValueEnv,
@@ -49,6 +51,18 @@ getVarTy sym venv =
   case Symtab.get sym venv of
     Just (VarEntry ventry) -> Just (ventry_ty ventry)
     _                      -> Nothing
+
+getVarAccess :: Symbol -> ValueEnv a -> Maybe (Access a)
+getVarAccess sym venv =
+  case Symtab.get sym venv of
+    Just (VarEntry ventry) -> Just (ventry_access ventry)
+    _                      -> Nothing
+
+getVarEntry :: Symbol -> ValueEnv a -> Maybe (VEntry a)
+getVarEntry sym venv =
+  case Symtab.get sym venv of
+    Just (VarEntry v) -> Just v
+    _                 -> Nothing
 
 getFunEntry :: Symbol -> ValueEnv a -> Maybe (FEntry a)
 getFunEntry sym venv =
