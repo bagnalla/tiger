@@ -1,3 +1,4 @@
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE TypeFamilies #-}
 
 module Frame (
@@ -5,7 +6,11 @@ module Frame (
   ) where
 
 import Temp (Label, Temp)
-import Tree (Exp)
+import Tree (Exp, Stm)
+
+data Frag a where
+  FProc   :: Frame a => Stm -> a -> Frag a
+  FString :: Label -> String -> Frag a
 
 class Frame a where
   type Access a :: *
@@ -21,3 +26,5 @@ class Frame a where
   fp         :: a -> Temp
   wordSize   :: a -> Int
   exp        :: a -> Access a -> Exp -> Exp
+  
+  externalCall :: a -> String -> [Exp] -> Exp

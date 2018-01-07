@@ -12,11 +12,11 @@ import Control.Monad.State
 nextSym :: (Num s, Show s, MonadState s m) => String -> m String
 nextSym prefix = do
   i <- get
-  put $ i + 1
+  put $ i + 1 -- IMPORTANT: i + 1, not 1 + i. See TransState in Semant.hs.
   return $ prefix ++ show i
 
 nextNum :: (Num s, MonadState s m) => m s
 nextNum = do
   i <- get
-  put $ i + 1
+  put $ i + 1 -- IMPORTANT: i + 1, not 1 + i. See TransState in Semant.hs.
   return $ i

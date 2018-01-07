@@ -207,8 +207,14 @@ Exp :
   | Exp ">=" Exp { mkOp GeOp $1 $3 $2 }
   | Exp '>' Exp { mkOp GtOp $1 $3 $2 }
   | Exp "<>" Exp { mkOp NeqOp $1 $3 $2 }
-  | Exp '&' Exp { NilExp }
-  | Exp '|' Exp { NilExp }
+  | Exp '&' Exp { IfExp (If { if_test = $1,
+                              if_then = $3,
+                              if_else = Just (IntExp 0),
+                              if_pos = $2 }) }
+  | Exp '|' Exp { IfExp (If { if_test = $1,
+                              if_then = IntExp 1,
+                              if_else = Just $3,
+                              if_pos = $2 }) }
   | id '{' opt(Recfields) '}'
       { let (id, pos) = extractId $1 in
           RecordExp (Record { record_fields = fromMaybe [] $3,

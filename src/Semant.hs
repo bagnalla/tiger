@@ -1,3 +1,5 @@
+{-# LANGUAGE FlexibleInstances #-}
+
 module Semant (
   ExpTy(..),
   runTrans,
@@ -26,8 +28,10 @@ import           Gensym (nextNum)
 import           Symtab as S (add, empty, get)
 import           Temp (makeString, newLabel, Label)
 import qualified Translate as T (dummyExp, Exp, outermost)
-import           Translate (Access, allocLocal, fieldVar, Level, newLevel,
-                            simpleVar, subscriptVar)
+import           Translate (Access, allocLocal, transFieldVar, Level,
+                            newLevel, transBreak, transFieldVar, transIf,
+                            transInt, transNil, transOp, transSimpleVar,
+                            transString, transSubscriptVar)
 import           Types (fixTys, isNil, showTy, Ty(..))
 
 data ExpTy = ExpTy
@@ -37,9 +41,28 @@ data ExpTy = ExpTy
 
 -- The third element is a flag denoting whether a 'break' expression is
 -- legal in the current context.
-type Context b = (TypeEnv, ValueEnv b, Bool, Level b)
+type Context b = (TypeEnv, ValueEnv b, Maybe Label, Level b)
+type TransState = (Int, ())
 
-type TransM a b = ReaderT (Context b) (ExceptT String (StateT Int Identity)) a
+-- Here we declare a Num instance for TransState, which allows us to
+-- treat a TransState as a number. It just uses the internal Int and
+-- doesn't change the rest of the state. For +, -, and *, the result
+-- inherits the state of the LEFT operand, so it's important to do,
+-- for example, st + 1 rather than 1 + st unless you want to reset the
+-- state.
+-- The whole point of this is to allow arbitrary state while being
+-- compatible with the generic GenSym module, so it's a bit of a hack.
+instance Num TransState where
+  (a, x) + (b, _) = (a + b, x)
+  (a, x) - (b, _) = (a - b, x)
+  (a, x) * (b, _) = (a * b, x)
+  abs (a, x)      = (abs a, x)
+  signum (a, x)   = (signum a, x)
+  fromInteger i   = (fromInteger i, ())
+  negate (a, x)   = (negate a, x)
+
+type TransM a b =
+  ReaderT (Context b) (ExceptT String (StateT TransState Identity)) a
 
 raise :: String -> Pos -> TransM a b
 raise str pos =
@@ -104,7 +127,7 @@ transVar (SimpleVar sym pos) = do
       -- used. simpleVar compares these to generate the correct IR
       -- code for accessing the var (following static links if
       -- necessary).
-      return ExpTy { expty_exp = simpleVar (ventry_access ventry) lvl,
+      return ExpTy { expty_exp = transSimpleVar (ventry_access ventry) lvl,
                      expty_ty = ventry_ty ventry }
     _       -> raise "unbound variable identifier" pos
 
@@ -118,7 +141,7 @@ transVar (FieldVar var sym pos) = do
             -- Get index of the field
             case findIndex ((== sym) . fst) fieldTys of
               Just i -> do
-                exp <- fieldVar lvl (expty_exp var') i
+                exp <- transFieldVar lvl (expty_exp var') i
                 return ExpTy { expty_exp = exp,
                                expty_ty = ty }
               _          -> raise "impossible" pos
@@ -131,7 +154,7 @@ transVar (SubscriptVar var i_exp pos) = do
   case (expty_ty var') of
     ArrayTy ty _ -> do
       (_, _, _, lvl) <- ask
-      exp <- subscriptVar lvl (expty_exp var') (expty_exp i_exp')
+      exp <- transSubscriptVar lvl (expty_exp var') (expty_exp i_exp')
       return ExpTy { expty_exp = exp,
                      expty_ty = ty }
     _ -> raise "expected array type" pos
@@ -151,13 +174,14 @@ transExp :: Frame b => Exp -> TransM ExpTy b
 transExp (VarExp var) = transVar var
 
 transExp NilExp =
-  return ExpTy { expty_exp = T.dummyExp, expty_ty = NilTy }
+  return ExpTy { expty_exp = transNil, expty_ty = NilTy }
 
 transExp (IntExp i) =
-  return ExpTy { expty_exp = T.dummyExp, expty_ty = IntTy }
+  return ExpTy { expty_exp = transInt i, expty_ty = IntTy }
 
-transExp (StringExp str pos) =
-  return ExpTy { expty_exp = T.dummyExp, expty_ty = StringTy }
+transExp (StringExp str pos) = do
+  exp <- transString str
+  return ExpTy { expty_exp = exp, expty_ty = StringTy }
 
 transExp (CallExp c) = do
   (_, venv, _, _) <- ask
@@ -178,16 +202,17 @@ transExp (CallExp c) = do
 
 transExp (OpExp op) =
   case op_oper op of
-    oper | oper `elem` [PlusOp, MinusOp, TimesOp, DivideOp,
-                        LtOp, LeOp, GtOp, GeOp] -> do
+    oper | oper `elem` [PlusOp, MinusOp, TimesOp, DivideOp] -> do
       left'  <- assertExpTy (op_left op) IntTy (op_pos op)
       right' <- assertExpTy (op_right op) IntTy (op_pos op)
-      return ExpTy { expty_exp = T.dummyExp, expty_ty = IntTy }
-    oper | oper `elem` [EqOp, NeqOp] -> do
+      exp <- transOp IntTy oper (expty_exp left') (expty_exp right')
+      return ExpTy { expty_exp = exp, expty_ty = IntTy }
+    oper | oper `elem` [LtOp, LeOp, GtOp, GeOp, EqOp, NeqOp] -> do
       left'  <- transExp (op_left op)
       let ty = expty_ty left'
       right' <- assertExpTy (op_right op) ty (op_pos op)
-      return ExpTy { expty_exp = T.dummyExp, expty_ty = ty }
+      exp <- transOp ty oper (expty_exp left') (expty_exp right')
+      return ExpTy { expty_exp = exp, expty_ty = ty }
 
 transExp (RecordExp rcd) = do
   recordTy <- getTy (record_typ rcd) (record_pos rcd)
@@ -219,21 +244,26 @@ transExp (AssignExp a) = do
   return ExpTy { expty_exp = T.dummyExp, expty_ty = UnitTy }
 
 transExp (IfExp ifE) = do
-  assertExpTy (if_test ifE) IntTy (if_pos ifE)
+  b <- assertExpTy (if_test ifE) IntTy (if_pos ifE)
   then' <- transExp (if_then ifE)
   case if_else ifE of
     Just exp -> do
-      assertExpTy exp (expty_ty then') (if_pos ifE)
-      return ()
+      else' <- assertExpTy exp (expty_ty then') (if_pos ifE)
+      exp <- transIf (expty_exp b) (expty_exp then')
+        (Just (expty_exp else'))
+      return ExpTy { expty_exp = exp, expty_ty = expty_ty then' }
     Nothing  -> if expty_ty then' /= UnitTy then
                   raise "expected unit type for if-then" (if_pos ifE)
-                else return ()
-  return ExpTy { expty_exp = T.dummyExp,
-                 expty_ty = expty_ty then' }
+                else
+                  do
+                    exp <- transIf (expty_exp b) (expty_exp then') Nothing
+                    return ExpTy { expty_exp = exp,
+                                   expty_ty = expty_ty then' }
 
 transExp (WhileExp w) = do
   assertExpTy (while_test w) IntTy (while_pos w)
-  local (\(tenv, venv, _, lvl) -> (tenv, venv, True, lvl))
+  done_lbl <- newLabel () -- pass this to translate function
+  local (\(tenv, venv, _, lvl) -> (tenv, venv, Just done_lbl, lvl))
     (do
         body' <- assertExpTy (while_body w) UnitTy (while_pos w)
         return ExpTy { expty_exp = T.dummyExp,
@@ -244,11 +274,12 @@ transExp (ForExp f) = do
   assertExpTy (for_hi f) IntTy (for_pos f)
   (_, _, _, lvl) <- ask
   let access = allocLocal lvl True
+  done_lbl <- newLabel ()
   local (\(tenv, venv, _, lvl) ->
             (tenv, S.add (for_var f)
                    (VarEntry VEntry { ventry_access = access,
                                       ventry_ty     = IntTy })
-                   venv, True, lvl))
+                   venv, Just done_lbl, lvl))
     (do
         body' <- assertExpTy (for_body f) UnitTy (for_pos f)
         if isVarAssigned (for_var f) (for_body f) then
@@ -259,9 +290,10 @@ transExp (ForExp f) = do
 
 transExp (BreakExp pos) = do
   (_, _, b, _) <- ask
-  if b then return ExpTy { expty_exp = T.dummyExp,
-                           expty_ty = UnitTy }
-    else raise "illegal break" pos
+  case b of
+    Just lbl -> return ExpTy { expty_exp = transBreak lbl,
+                               expty_ty = UnitTy }
+    Nothing  -> raise "illegal break" pos
 
 transExp (LetExp l) = do
   ctx <- ask
@@ -309,7 +341,7 @@ transDec (FunctionDec fundecs) =
     -- Typecheck function bodies
     local (const (tenv, venv', b, lvl))
       (mapM (\(f, lvl) -> h f lvl) (zip fundecs levels))
-    -- Return the extended coxntext
+    -- Return the extended context
     return (tenv, venv', b, lvl)
     
       -- Make header from a fundec
@@ -417,14 +449,14 @@ traceCycle _ _ _ = False
 transTy :: A.Ty -> TransM Ty b
 transTy (A.NameTy sym pos) = getTy sym pos
 transTy (A.RecordTy fields) = do
-  tyId <- nextNum
+  (tyId, _) <- nextNum
   fields' <- mapM f fields
   return (RecordTy fields' tyId)
     where f fld = do
             ty <- getTy (field_typ fld) (field_pos fld)
             return ((field_name fld), ty)
 transTy (A.ArrayTy sym pos) = do
-  tyId <- nextNum
+  (tyId, _) <- nextNum
   ty <- getTy sym pos
   return (ArrayTy ty tyId)
 
@@ -438,7 +470,7 @@ transProg p = transExp p
 -- Run the translation computation
 
 initContext :: Frame b => Context b
-initContext = (base_tenv, base_venv, False, T.outermost)
+initContext = (base_tenv, base_venv, Nothing, T.outermost)
 
 runTrans :: Frame b => TransM a b -> Either String a
 runTrans t = fst $ runIdentity (runStateT (runExceptT (runReaderT t

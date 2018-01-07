@@ -31,8 +31,6 @@ data Binop =
   | BMinus
   | BMul
   | BDiv
-  | BAnd
-  | BOr
   | BLShift
   | BRShift
   | BARShift
@@ -50,4 +48,4 @@ data Relop =
   | RULe
   | RUGt
   | RUGe
-  deriving (Show)
+  deriving (Eq, Show)

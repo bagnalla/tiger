@@ -1,20 +1,22 @@
 {-# LANGUAGE GADTs #-}
 
 module Translate (
-  Access, Exp, Level, allocLocal, dummyExp, fieldVar, formals, newLevel,
-  outermost, simpleVar, subscriptVar
+  Access, Exp, Level, allocLocal, dummyExp, formals, newLevel, outermost,
+  transBreak, transFieldVar, transIf, transInt, transNil, transOp,
+  transSimpleVar, transString, transSubscriptVar
   ) where
 
 import           Control.Monad.State
 
+import           Absyn (Oper(..))
 import           Frame (Frame, name, newFrame)
 import qualified Frame as F (Access, allocLocal, exp, formals, fp,
                              wordSize)
-import           Temp (Label, newLabel, newTemp)
+import           Temp (Label, namedLabel, newLabel, newTemp)
 import           Tree (Binop(..), Relop(..), Stm(..))
 import qualified Tree as T (Exp(..))
+import           Types (Ty(..))
 
--- Is there an actual way to do this?
 instance Show (a -> b) where
   show f = "<#function>"
 
@@ -73,10 +75,6 @@ unCx (Ex exp) = \(t, f) -> SCJump REq exp (T.EConst 0) f t
 unCx (Nx _) = error "unCx: Nx constructor should never appear here"
 unCx (Cx genstm) = genstm
 
--- data Level a =
---   LOutermost
---   | Level (Level a) a
-
 -- The class constraint here may not be strictly necessary, but it's
 -- probably a good idea to express the invariant explicitly so the
 -- type system can enforce it (that this datatype is only instantiated
@@ -88,6 +86,7 @@ data Level a where
 instance Eq (Level a) where
   LOutermost == LOutermost = True
   Level _ f1 == Level _ f2 = name f1 == name f2
+  _          == _          = False
 
 frameOfLevel :: Frame a => Level a -> a
 frameOfLevel (Level _ f) = f
@@ -136,6 +135,12 @@ allocLocal lvl b =
       acc   = F.allocLocal frame b in
     Access lvl acc
 
+-----------------------
+-- Tree IR translation.
+
+-- The following functions are used by the typechecker to translate
+-- the AST into tree IR.
+
 -- Given the declaration level and use level, produce a Tree.Exp that
 -- walks the static links from the use level frame pointer to the
 -- declaration level frame pointer. The result value is the address of
@@ -157,17 +162,17 @@ followLinks lvlDec lvlUse =
 -- at which the variable is being used.
 -- First we use followLinks to obtain the correct frame pointer, and
 -- then pass it to the Frame exp function to access the variable.
-simpleVar :: Frame a => Access a -> Level a -> Exp
-simpleVar (Access lvlDec acc) lvlUse =
+transSimpleVar :: Frame a => Access a -> Level a -> Exp
+transSimpleVar (Access lvlDec acc) lvlUse =
   let frame = frameOfLevel lvlUse
       fp    = followLinks lvlDec lvlUse in
     Ex (F.exp frame acc fp)
 
 -- MEM(MEM(e) + (i * CONST W))
 -- where e is the array var, i is the index, and w is the word size.
-subscriptVar :: (Num s, Show s, MonadState s m, Frame a) =>
+transSubscriptVar :: (Num s, Show s, MonadState s m, Frame a) =>
   Level a -> Exp -> Exp -> m Exp
-subscriptVar lvl arr i = do
+transSubscriptVar lvl arr i = do
   let frame = frameOfLevel lvl
       w     = (T.EConst (F.wordSize frame))
   arr' <- unEx arr
@@ -177,11 +182,144 @@ subscriptVar lvl arr i = do
 -- Very similar to above since we just index into the record based on
 -- the order of the fields, essentially treating it as an array. The
 -- index is passed in from Semant.
-fieldVar :: (Num s, Show s, MonadState s m, Frame a) =>
+transFieldVar :: (Num s, Show s, MonadState s m, Frame a) =>
   Level a -> Exp -> Int -> m Exp
-fieldVar lvl record i = do
+transFieldVar lvl record i = do
   let frame = frameOfLevel lvl
       w     = (T.EConst (F.wordSize frame))
   record' <- unEx record
   return . Ex . T.EMem $ T.EBinop BPlus record'
     (T.EBinop BMul (T.EConst i) w)
+
+-------------
+-- Constants
+
+-- Not sure what this should be, using constant 0 for now.
+transNil :: Exp
+transNil = Ex (T.EConst 0)
+
+transInt :: Int -> Exp
+transInt i = Ex (T.EConst i)
+
+-- TODO: also return fragment
+transString :: (Num s, Show s, MonadState s m) => String -> m Exp
+transString s = do
+  lbl <- newLabel ()
+  return $ Ex (T.EName lbl)
+
+-------------------
+-- Binops / Relops
+
+transBinop :: Oper -> Binop
+transBinop b =
+  case b of
+    PlusOp   -> BPlus
+    MinusOp  -> BMinus
+    TimesOp  -> BMul
+    DivideOp -> BDiv
+    _        -> error "transBinop: invalid Oper"
+
+transRelop :: Oper -> Relop
+transRelop b =
+  case b of
+    EqOp  -> REq
+    NeqOp -> RNe
+    LtOp  -> RLt
+    LeOp  -> RLe
+    GtOp  -> RGt
+    GeOp  -> RGe
+    _     -> error "transRelop: invalid Oper"    
+
+transArith :: (Num s, Show s, MonadState s m) => Oper -> Exp -> Exp -> m Exp
+transArith op e1 e2 = do
+  let binop = transBinop op
+  e1' <- unEx e1
+  e2' <- unEx e2
+  return $ Ex (T.EBinop binop e1' e2')
+  -- Honestly I prefer the simple way above, at least in this case.
+  -- return Ex `ap` (return (T.EBinop binop) `ap` (unEx e1) `ap` (unEx e2))
+
+relopStringFun :: Relop -> (String, Bool)
+relopStringFun r =
+  if r `elem` [REq, RNe] then
+    ("stringEqual", r == REq)
+  else if r `elem` [RLt, RGt] then
+    ("stringLessThan", r == RLt)
+  else
+    ("stringLessThanOrEqual", r == RLe)
+
+relopStringCond :: Relop -> T.Exp -> T.Exp -> ((Label, Label) -> Stm)
+relopStringCond r arg1 arg2  =
+  let (funName, b) = relopStringFun r
+      e = T.ECall (T.EName (namedLabel funName)) [arg1, arg2] in
+    if b then
+      \(t, f) -> SCJump REq e (T.EConst 0) f t
+    else
+      \(t, f) -> SCJump REq e (T.EConst 0) t f
+
+-- We treat strings specially by delegating their comparison to
+-- runtime functions.
+transCond :: (Num s, Show s, MonadState s m) =>
+  Ty -> Oper -> Exp -> Exp -> m Exp
+transCond ty op e1 e2 = do
+  let relop = transRelop op
+  e1' <- unEx e1
+  e2' <- unEx e2
+  return $
+    if ty == StringTy then
+      Cx (relopStringCond relop e1' e2')
+    else
+      Cx (\(t, f) -> SCJump relop e1' e2' t f)
+      
+transOp :: (Num s, Show s, MonadState s m) =>
+  Ty -> Oper -> Exp -> Exp -> m Exp
+transOp ty op e1 e2 =
+  if op `elem` [PlusOp, MinusOp, TimesOp, DivideOp] then
+    transArith op e1 e2
+  else
+    transCond ty op e1 e2
+
+----------------
+-- Conditionals
+
+transIf :: (Num s, Show s, MonadState s m) =>
+  Exp -> Exp -> Maybe Exp -> m Exp
+transIf e1 e2 e3 = do
+  let e1' = unCx e1
+  e2' <- unEx e2
+  t <- newTemp ()
+  t_lbl <- newLabel ()
+  f_lbl <- newLabel ()
+  let temp = T.ETemp t
+  case e3 of
+    Just e -> do
+      e3' <- unEx e
+      end_lbl <- newLabel ()
+      return $ Ex $ T.ESeq (seqstm [e1' (t_lbl, f_lbl),
+                                    SLabel t_lbl,
+                                    SMove e2' temp,
+                                    SJump (T.EName end_lbl) [end_lbl],
+                                    SLabel f_lbl,
+                                    SMove e3' temp,
+                                    SLabel end_lbl
+                                   ])
+        temp
+    Nothing -> do
+      return $ Ex $ T.ESeq (seqstm [e1' (t_lbl, f_lbl),
+                                    SLabel t_lbl,
+                                    SMove e2' temp,
+                                    SLabel f_lbl
+                                   ])
+        temp
+
+-----------
+-- Records
+
+-- transRecord :: (Num s, Show s, MonadState s m) =>
+--   Exp -> Exp -> Maybe Exp -> m Exp
+
+---------
+-- Break
+
+transBreak :: Label -> Exp
+transBreak lbl = Nx $ SJump (T.EName lbl) [lbl]
