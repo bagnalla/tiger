@@ -18,10 +18,10 @@ data Exp =
   deriving (Show)
 
 data Stm =
-  SMove Exp Exp
+  SMove Exp Exp -- Intel syntax: destination then source
   | SExp Exp
   | SJump Exp [Label]
-  | SCJump Relop Exp Exp Label Label
+  | SCJump Relop Exp Exp Label Label -- true then false
   | SSeq Stm Stm
   | SLabel Label
   deriving (Show)

@@ -2,16 +2,17 @@
 
 module Translate (
   Access, Exp, Level, allocLocal, dummyExp, formals, newLevel, outermost,
-  transBreak, transFieldVar, transIf, transInt, transNil, transOp,
-  transSimpleVar, transString, transSubscriptVar
+  transArray, transAssign, transBreak, transCall, transFieldVar, transFor,
+  transIf, transInt, transNil, transOp, transRecord, transSeq,
+  transSimpleVar, transString, transSubscriptVar, transWhile
   ) where
 
 import           Control.Monad.State
 
 import           Absyn (Oper(..))
 import           Frame (Frame, name, newFrame)
-import qualified Frame as F (Access, allocLocal, exp, formals, fp,
-                             wordSize)
+import qualified Frame as F (Access, allocLocal, exp, externalCall,
+                             formals, fp, wordSize)
 import           Temp (Label, namedLabel, newLabel, newTemp)
 import           Tree (Binop(..), Relop(..), Stm(..))
 import qualified Tree as T (Exp(..))
@@ -106,6 +107,9 @@ parentOfLevel _ = error "parentOfLevel: outermost level has no parent"
 -- must be an instance of Frame.
 data Access a =
   Access (Level a) (F.Access a)
+
+levelOfAccess :: Access a -> Level a
+levelOfAccess (Access lvl _) = lvl
 
 outermost :: Frame a => Level a
 outermost = LOutermost
@@ -248,10 +252,12 @@ relopStringFun r =
   else
     ("stringLessThanOrEqual", r == RLe)
 
-relopStringCond :: Relop -> T.Exp -> T.Exp -> ((Label, Label) -> Stm)
-relopStringCond r arg1 arg2  =
+relopStringCond :: Frame a => Level a -> Relop -> T.Exp -> T.Exp ->
+  ((Label, Label) -> Stm)
+relopStringCond lvl r arg1 arg2  =
   let (funName, b) = relopStringFun r
-      e = T.ECall (T.EName (namedLabel funName)) [arg1, arg2] in
+      extern = F.externalCall (frameOfLevel lvl)
+      e = extern funName [arg1, arg2] in
     if b then
       \(t, f) -> SCJump REq e (T.EConst 0) f t
     else
@@ -259,25 +265,25 @@ relopStringCond r arg1 arg2  =
 
 -- We treat strings specially by delegating their comparison to
 -- runtime functions.
-transCond :: (Num s, Show s, MonadState s m) =>
-  Ty -> Oper -> Exp -> Exp -> m Exp
-transCond ty op e1 e2 = do
+transCond :: (Num s, Show s, MonadState s m, Frame a) =>
+  Level a -> Ty -> Oper -> Exp -> Exp -> m Exp
+transCond lvl ty op e1 e2 = do
   let relop = transRelop op
   e1' <- unEx e1
   e2' <- unEx e2
   return $
     if ty == StringTy then
-      Cx (relopStringCond relop e1' e2')
+      Cx (relopStringCond lvl relop e1' e2')
     else
       Cx (\(t, f) -> SCJump relop e1' e2' t f)
-      
-transOp :: (Num s, Show s, MonadState s m) =>
-  Ty -> Oper -> Exp -> Exp -> m Exp
-transOp ty op e1 e2 =
+
+transOp :: (Num s, Show s, MonadState s m, Frame a) =>
+  Level a -> Ty -> Oper -> Exp -> Exp -> m Exp
+transOp lvl ty op e1 e2 =
   if op `elem` [PlusOp, MinusOp, TimesOp, DivideOp] then
     transArith op e1 e2
   else
-    transCond ty op e1 e2
+    transCond lvl ty op e1 e2
 
 ----------------
 -- Conditionals
@@ -297,17 +303,17 @@ transIf e1 e2 e3 = do
       end_lbl <- newLabel ()
       return $ Ex $ T.ESeq (seqstm [e1' (t_lbl, f_lbl),
                                     SLabel t_lbl,
-                                    SMove e2' temp,
+                                    SMove temp e2',
                                     SJump (T.EName end_lbl) [end_lbl],
                                     SLabel f_lbl,
-                                    SMove e3' temp,
+                                    SMove temp e3',
                                     SLabel end_lbl
                                    ])
         temp
     Nothing -> do
       return $ Ex $ T.ESeq (seqstm [e1' (t_lbl, f_lbl),
                                     SLabel t_lbl,
-                                    SMove e2' temp,
+                                    SMove temp e2',
                                     SLabel f_lbl
                                    ])
         temp
@@ -315,11 +321,101 @@ transIf e1 e2 e3 = do
 -----------
 -- Records
 
--- transRecord :: (Num s, Show s, MonadState s m) =>
---   Exp -> Exp -> Maybe Exp -> m Exp
+-- Here we take a Level argument from Semant just so we can get the
+-- word size from its frame.
+transRecord :: (Num s, Show s, MonadState s m, Frame a) =>
+  Level a -> [Exp] -> m Exp
+transRecord lvl es = do
+  t <- newTemp ()
+  es' <- mapM unEx es
+  let temp = T.ETemp t -- make new temp
+      n = length es
+      w = F.wordSize (frameOfLevel lvl)
+      extern = F.externalCall (frameOfLevel lvl)
+      alloc = SMove temp (extern "malloc" [T.EConst (n*w)]) -- allocate record
+      inits = map (f w temp) (zip es' [0..]) -- initialize fields
+  return $ Ex $ T.ESeq (seqstm (alloc : inits)) temp -- put it all together
+  where f w temp (e, i) =
+          SMove (T.EMem (T.EBinop BPlus temp (T.EConst (i*w)))) e
+
+----------
+-- Arrays
+
+transArray :: (Num s, Show s, MonadState s m, Frame a) =>
+  Level a -> Exp -> Exp -> m Exp
+transArray lvl init size = do
+  let extern = F.externalCall (frameOfLevel lvl)
+  init' <- unEx init
+  size' <- unEx size
+  return . Ex $ extern "initArray" [init', size']
+
+---------
+-- While
+transWhile :: (Num s, Show s, MonadState s m) =>
+  Label -> Exp -> Exp -> m Exp
+transWhile done_lbl test body = do
+  test_lbl <- newLabel ()
+  body_lbl <- newLabel ()
+  test' <- unEx test
+  body' <- unNx body
+  return . Nx $
+    seqstm [SLabel test_lbl,
+            SCJump REq test' (T.EConst 0) done_lbl body_lbl,
+            SLabel body_lbl,
+            body',
+            SJump (T.EName test_lbl) [test_lbl],
+            SLabel done_lbl]
 
 ---------
 -- Break
 
 transBreak :: Label -> Exp
 transBreak lbl = Nx $ SJump (T.EName lbl) [lbl]
+
+-------
+-- For
+
+transFor :: (Num s, Show s, MonadState s m, Frame a) =>
+  Access a -> Label -> Exp -> Exp -> Exp -> m Exp
+transFor access done_lbl lo hi body = do
+  let counter = transSimpleVar access (levelOfAccess access)
+  counter' <- unEx counter
+  body_lbl <- newLabel ()
+  inc_lbl  <- newLabel ()
+  lo'   <- unEx lo
+  hi'   <- unEx hi
+  body' <- unNx body
+  return . Nx $
+    seqstm [SCJump RLe lo' hi' body_lbl done_lbl,
+            SLabel body_lbl,
+            body',
+            SCJump RLt lo' hi' inc_lbl done_lbl,
+            SLabel inc_lbl,
+            SMove counter' (T.EBinop BPlus counter' (T.EConst 1)),
+            SJump (T.EName body_lbl) [body_lbl],
+            SLabel done_lbl]
+
+------------------
+-- Function calls
+
+transCall :: (Num s, Show s, MonadState s m, Frame a) =>
+  Label -> [Exp] -> Level a -> Level a -> m Exp
+transCall f es lvlDec lvlUse = do
+  es' <- mapM unEx es
+  let link = followLinks (parentOfLevel lvlDec) lvlUse
+  return . Ex $ T.ECall (T.EName f) (link : es')
+
+-------------
+-- Sequences
+
+transSeq :: (Num s, Show s, MonadState s m) => [Exp] -> m Exp
+transSeq es = do
+  es' <- mapM unNx es
+  return . Nx $ seqstm es'
+
+--------------
+-- Assignment
+
+-- TODO
+transAssign :: (Num s, Show s, MonadState s m) => Exp -> Exp -> m Exp
+transAssign dst src = transAssign dst src

@@ -27,11 +27,13 @@ import           Frame (Frame)
 import           Gensym (nextNum)
 import           Symtab as S (add, empty, get)
 import           Temp (makeString, newLabel, Label)
-import qualified Translate as T (dummyExp, Exp, outermost)
+import qualified Translate as T (Exp, outermost)
 import           Translate (Access, allocLocal, transFieldVar, Level,
-                            newLevel, transBreak, transFieldVar, transIf,
-                            transInt, transNil, transOp, transSimpleVar,
-                            transString, transSubscriptVar)
+                            newLevel, transArray, transAssign, transBreak,
+                            transCall, transFieldVar, transFor, transIf,
+                            transInt, transNil, transOp, transRecord,
+                            transSeq, transSimpleVar, transString,
+                            transSubscriptVar, transWhile)
 import           Types (fixTys, isNil, showTy, Ty(..))
 
 data ExpTy = ExpTy
@@ -184,7 +186,7 @@ transExp (StringExp str pos) = do
   return ExpTy { expty_exp = exp, expty_ty = StringTy }
 
 transExp (CallExp c) = do
-  (_, venv, _, _) <- ask
+  (_, venv, _, lvl) <- ask
   case getFunEntry (call_func c) venv of
     Nothing -> raise "unbound function identifier" (call_pos c)
     Just f  ->
@@ -193,55 +195,61 @@ transExp (CallExp c) = do
       else do
         args' <- mapM transExp (call_args c)
         foldM g () (zip (map expty_ty args') (fentry_formals f))
-        return ExpTy { expty_exp = T.dummyExp,
+        exp <- transCall (fentry_label f) (map expty_exp args')
+          (fentry_level f) lvl
+        return ExpTy { expty_exp = exp,
                        expty_ty = fentry_result f }
           where g _ (arg_ty, formal_ty) =
                   if arg_ty == formal_ty then return ()
                   else raise ("expected " ++ showTy formal_ty ++ ", found " ++
                               showTy arg_ty) (call_pos c)
 
-transExp (OpExp op) =
+transExp (OpExp op) = do
+  (_, _, _, lvl) <- ask
   case op_oper op of
     oper | oper `elem` [PlusOp, MinusOp, TimesOp, DivideOp] -> do
       left'  <- assertExpTy (op_left op) IntTy (op_pos op)
       right' <- assertExpTy (op_right op) IntTy (op_pos op)
-      exp <- transOp IntTy oper (expty_exp left') (expty_exp right')
+      exp <- transOp lvl IntTy oper (expty_exp left') (expty_exp right')
       return ExpTy { expty_exp = exp, expty_ty = IntTy }
     oper | oper `elem` [LtOp, LeOp, GtOp, GeOp, EqOp, NeqOp] -> do
       left'  <- transExp (op_left op)
       let ty = expty_ty left'
       right' <- assertExpTy (op_right op) ty (op_pos op)
-      exp <- transOp ty oper (expty_exp left') (expty_exp right')
+      exp <- transOp lvl ty oper (expty_exp left') (expty_exp right')
       return ExpTy { expty_exp = exp, expty_ty = ty }
 
 transExp (RecordExp rcd) = do
   recordTy <- getTy (record_typ rcd) (record_pos rcd)
   case recordTy of
     RecordTy fieldTys _ -> do
-      foldM f () (zip (record_fields rcd) fieldTys)
-      return ExpTy { expty_exp = T.dummyExp,
-                     expty_ty = recordTy }
+      fields <- mapM f (zip (record_fields rcd) fieldTys)
+      (_, _, _, lvl) <- ask
+      exp <- transRecord lvl (map expty_exp fields)
+      return ExpTy { expty_exp = exp, expty_ty = recordTy }
     -- NilTy ->
     --   if length (record_fields rcd) > 0 then
     --     raise "expected no fields for Nil record type" (record_pos rcd)
     --   else
     --     return ExpTy { expty_exp = (), expty_ty = NilTy }
     _ -> raise "expected record type" (record_pos rcd)
-    where f _ ((sym1, exp, pos), (sym2, ty)) = do
-            ty' <- transExp exp
-            if sym1 == sym2 && (expty_ty ty') == ty then return ()
+    where f ((sym1, exp, pos), (sym2, ty)) = do
+            exp' <- transExp exp
+            if sym1 == sym2 && (expty_ty exp') == ty then return exp'
               else raise ("expected field " ++ show sym2 ++ " :: " ++ showTy ty)
                    pos
 
-transExp (SeqExp seq) =
-  foldM f x seq
-  where f _ (exp, pos) = transExp exp
-        x = ExpTy { expty_exp = T.dummyExp, expty_ty = UnitTy }
+transExp (SeqExp seq) = do
+  es <- mapM f seq
+  exp <- transSeq (map expty_exp es)
+  return ExpTy { expty_exp = exp, expty_ty = UnitTy }
+  where f (exp, pos) = transExp exp
 
 transExp (AssignExp a) = do
   var' <- transVar (assign_var a)
-  assertExpTy (assign_exp a) (expty_ty var') (assign_pos a)
-  return ExpTy { expty_exp = T.dummyExp, expty_ty = UnitTy }
+  val <- assertExpTy (assign_exp a) (expty_ty var') (assign_pos a)
+  exp <- transAssign (expty_exp var') (expty_exp val)
+  return ExpTy { expty_exp = exp, expty_ty = UnitTy }
 
 transExp (IfExp ifE) = do
   b <- assertExpTy (if_test ifE) IntTy (if_pos ifE)
@@ -252,26 +260,28 @@ transExp (IfExp ifE) = do
       exp <- transIf (expty_exp b) (expty_exp then')
         (Just (expty_exp else'))
       return ExpTy { expty_exp = exp, expty_ty = expty_ty then' }
-    Nothing  -> if expty_ty then' /= UnitTy then
-                  raise "expected unit type for if-then" (if_pos ifE)
-                else
-                  do
-                    exp <- transIf (expty_exp b) (expty_exp then') Nothing
-                    return ExpTy { expty_exp = exp,
-                                   expty_ty = expty_ty then' }
+    Nothing  ->
+      if expty_ty then' /= UnitTy then
+        raise "expected unit type for if-then" (if_pos ifE)
+      else
+        do
+          exp <- transIf (expty_exp b) (expty_exp then') Nothing
+          return ExpTy { expty_exp = exp,
+                         expty_ty = expty_ty then' }
 
 transExp (WhileExp w) = do
-  assertExpTy (while_test w) IntTy (while_pos w)
+  test <- assertExpTy (while_test w) IntTy (while_pos w)
   done_lbl <- newLabel () -- pass this to translate function
   local (\(tenv, venv, _, lvl) -> (tenv, venv, Just done_lbl, lvl))
     (do
-        body' <- assertExpTy (while_body w) UnitTy (while_pos w)
-        return ExpTy { expty_exp = T.dummyExp,
-                       expty_ty = expty_ty body' })
+        body <- assertExpTy (while_body w) UnitTy (while_pos w)
+        exp <- transWhile done_lbl (expty_exp test) (expty_exp body)
+        return ExpTy { expty_exp = exp,
+                       expty_ty = expty_ty body })
 
 transExp (ForExp f) = do
-  assertExpTy (for_lo f) IntTy (for_pos f)
-  assertExpTy (for_hi f) IntTy (for_pos f)
+  lo <- assertExpTy (for_lo f) IntTy (for_pos f)
+  hi <- assertExpTy (for_hi f) IntTy (for_pos f)
   (_, _, _, lvl) <- ask
   let access = allocLocal lvl True
   done_lbl <- newLabel ()
@@ -281,12 +291,14 @@ transExp (ForExp f) = do
                                       ventry_ty     = IntTy })
                    venv, Just done_lbl, lvl))
     (do
-        body' <- assertExpTy (for_body f) UnitTy (for_pos f)
+        body <- assertExpTy (for_body f) UnitTy (for_pos f)
         if isVarAssigned (for_var f) (for_body f) then
           raise "illegal assignment to loop index variable" (for_pos f)
-        else
-          return ExpTy { expty_exp = T.dummyExp,
-                         expty_ty = expty_ty body' })
+          else do
+          exp <- transFor access done_lbl (expty_exp lo)
+            (expty_exp hi) (expty_exp body)
+          return ExpTy { expty_exp = exp,
+                         expty_ty = expty_ty body })
 
 transExp (BreakExp pos) = do
   (_, _, b, _) <- ask
@@ -306,12 +318,16 @@ transExp (ArrayExp a) = do
   ty <- getTy (array_typ a) (array_pos a)
   case ty of
     ArrayTy ty tyID -> do
-      ty' <- transExp (array_init a)
-      if expty_ty ty' /= ty then
+      init <- transExp (array_init a)
+      if expty_ty init /= ty then
         raise ("expected type " ++ showTy ty ++ ", found " ++
-               showTy (expty_ty ty')) (array_pos a)
-        else return ExpTy { expty_exp = T.dummyExp,
-                            expty_ty = ArrayTy ty tyID }
+                showTy (expty_ty init)) (array_pos a)
+        else do
+        size <- assertExpTy (array_size a) IntTy (array_pos a)
+        (_, _, _, lvl) <- ask
+        exp <- transArray lvl (expty_exp init) (expty_exp size)
+        return ExpTy { expty_exp = exp,
+                       expty_ty = ArrayTy ty tyID }
     _ -> raise "expected array type" (array_pos a)
 
 -----------------
@@ -343,7 +359,7 @@ transDec (FunctionDec fundecs) =
       (mapM (\(f, lvl) -> h f lvl) (zip fundecs levels))
     -- Return the extended context
     return (tenv, venv', b, lvl)
-    
+
       -- Make header from a fundec
       where mkLevel lvl lbl fdec = do
               newLevel lvl lbl [True | _ <- fun_params fdec]

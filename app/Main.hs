@@ -39,7 +39,7 @@ main = do
           Right p' ->
             let p'' = ExpTy { expty_exp = expty_exp p',
                               expty_ty = approxTy 1 (expty_ty p') } in
-              -- putStrLn (show p'')
+              -- putStrLn (show p'') >>
               return ()
 
   -- ty <- test ()
