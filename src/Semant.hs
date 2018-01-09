@@ -23,17 +23,17 @@ import           Absyn (Array(..), Assign(..), Dec(..), Call(..), Exp(..),
 import           Env (base_tenv, base_venv, EnvEntry(..), FEntry(..),
                       getFunEntry, getVarAccess, getVarEntry, getVarTy,
                       TypeEnv, ValueEnv, VEntry(..))
-import           Frame (Frame)
+import           Frame (Frag, Frame)
 import           Gensym (nextNum)
 import           Symtab as S (add, empty, get)
-import           Temp (makeString, newLabel, Label)
-import qualified Translate as T (Exp, outermost)
+import           Temp (makeString, namedLabel, newLabel, Label)
+import qualified Translate as T (Exp, outermost, formals)
 import           Translate (Access, allocLocal, transFieldVar, Level,
                             newLevel, transArray, transAssign, transBreak,
-                            transCall, transFieldVar, transFor, transIf,
-                            transInt, transNil, transOp, transRecord,
-                            transSeq, transSimpleVar, transString,
-                            transSubscriptVar, transWhile)
+                            transCall, transFrags, transFieldVar, transFor,
+                            transIf, transInt, transNil, transOp,
+                            transRecord, transSeq, transSimpleVar,
+                            transString, transSubscriptVar, transWhile)
 import           Types (fixTys, isNil, showTy, Ty(..))
 
 data ExpTy = ExpTy
@@ -41,10 +41,14 @@ data ExpTy = ExpTy
     expty_ty  :: Ty }
   deriving (Show)
 
--- The third element is a flag denoting whether a 'break' expression is
--- legal in the current context.
+-- The third element is a flag denoting whether a 'break' expression
+-- is legal in the current context.
 type Context b = (TypeEnv, ValueEnv b, Maybe Label, Level b)
-type TransState = (Int, ())
+
+-- Use newtype so we can define our own Show instance without overlap.
+newtype TransState b = TransState (Int, [Frag b])
+
+fragsOfTransState (TransState (_, frags)) = frags
 
 -- Here we declare a Num instance for TransState, which allows us to
 -- treat a TransState as a number. It just uses the internal Int and
@@ -54,17 +58,28 @@ type TransState = (Int, ())
 -- state.
 -- The whole point of this is to allow arbitrary state while being
 -- compatible with the generic GenSym module, so it's a bit of a hack.
-instance Num TransState where
-  (a, x) + (b, _) = (a + b, x)
-  (a, x) - (b, _) = (a - b, x)
-  (a, x) * (b, _) = (a * b, x)
-  abs (a, x)      = (abs a, x)
-  signum (a, x)   = (signum a, x)
-  fromInteger i   = (fromInteger i, ())
-  negate (a, x)   = (negate a, x)
+instance Num (TransState a) where
+  TransState (a, x) + TransState (b, _) = TransState (a + b, x)
+  TransState (a, x) - TransState (b, _) = TransState (a - b, x)
+  TransState (a, x) * TransState (b, _) = TransState (a * b, x)
+  abs (TransState (a, x))               = TransState (abs a, x)
+  signum (TransState (a, x))            = TransState (signum a, x)
+  fromInteger i                         = TransState (fromInteger i, [])
+  negate (TransState (a, x))            = TransState (negate a, x)
+
+instance Show (TransState a) where
+  show (TransState (i, _)) = show i
+
+-- This makes me realize.. we should just be using a writer monad for
+-- fragments instead of messing with the state. I'll leave it like
+-- this for now, though, since it's already done.
+instance Monoid (TransState a) where
+  mempty = TransState (0, [])
+  TransState (i1, x1) `mappend` TransState (i2, x2) =
+    TransState (i1 + i2, x1 ++ x2)
 
 type TransM a b =
-  ReaderT (Context b) (ExceptT String (StateT TransState Identity)) a
+  ReaderT (Context b) (ExceptT String (StateT (TransState b) Identity)) a
 
 raise :: String -> Pos -> TransM a b
 raise str pos =
@@ -283,13 +298,13 @@ transExp (ForExp f) = do
   lo <- assertExpTy (for_lo f) IntTy (for_pos f)
   hi <- assertExpTy (for_hi f) IntTy (for_pos f)
   (_, _, _, lvl) <- ask
-  let access = allocLocal lvl True
+  let (access, lvl') = allocLocal lvl True
   done_lbl <- newLabel ()
   local (\(tenv, venv, _, lvl) ->
             (tenv, S.add (for_var f)
                    (VarEntry VEntry { ventry_access = access,
                                       ventry_ty     = IntTy })
-                   venv, Just done_lbl, lvl))
+                   venv, Just done_lbl, lvl'))
     (do
         body <- assertExpTy (for_body f) UnitTy (for_pos f)
         if isVarAssigned (for_var f) (for_body f) then
@@ -344,7 +359,6 @@ transDec (FunctionDec fundecs) =
   else do
     (tenv, venv, b, lvl) <- ask
     labels <- mapM (\_ -> newLabel ()) fundecs
-    -- ids    <- mapM (\_ -> nextNum) fundecs
     let levels = map (\(f, lbl) -> mkLevel lvl lbl f)
           (zip fundecs labels)
     -- Build function entries
@@ -355,8 +369,14 @@ transDec (FunctionDec fundecs) =
                          S.add (fun_name fdec) fentry acc)
                 venv (zip headers fundecs)
     -- Typecheck function bodies
-    local (const (tenv, venv', b, lvl))
+    bodies_levels <- local (const (tenv, venv', b, lvl))
       (mapM (\(f, lvl) -> h f lvl) (zip fundecs levels))
+
+    -- Add fragments to state
+    frags <- transFrags (map (\(body, lvl) -> (expty_exp body, lvl))
+                          bodies_levels)
+    modify (\st -> foldr mappend st (map (\f -> TransState (0, [f])) frags))
+           
     -- Return the extended context
     return (tenv, venv', b, lvl)
 
@@ -378,29 +398,30 @@ transDec (FunctionDec fundecs) =
             -- Typecheck the body of a fundec
             h fdec lvl = do
               (tenv, venv, b, _) <- ask
-              venv' <- foldM
-                       (\acc fld -> do
-                           ty <- getTy (field_typ fld) (field_pos fld)
-                           let access = allocLocal lvl True
-                           let ventry = VEntry { ventry_access = access,
-                                                 ventry_ty = ty }
-                           return $ S.add (field_name fld) (VarEntry ventry) acc)
-                       venv (fun_params fdec)
+              venv' <-
+                foldM (\venv (formal, fld) -> do
+                          ty <- getTy (field_typ fld) (field_pos fld)
+                          let ventry = VEntry { ventry_access = formal,
+                                                ventry_ty = ty }
+                          return $ S.add (field_name fld)
+                            (VarEntry ventry) venv)
+                venv (zip (T.formals lvl) (fun_params fdec))
               local (const (tenv, venv', b, lvl))
                 (case fun_result fdec of
                    Just (sym, pos) -> do
                      ty <- getTy sym pos
-                     assertExpTy (fun_body fdec) ty pos
-                   Nothing         -> assertExpTy (fun_body fdec) UnitTy
-                                      (fun_pos fdec))
-              return ()
+                     exp <- assertExpTy (fun_body fdec) ty pos
+                     return (exp, lvl)
+                   Nothing         -> do                     
+                     exp <- assertExpTy (fun_body fdec) UnitTy
+                       (fun_pos fdec)
+                     return (exp, lvl))
 
 transDec (VarDec v) = do
   exp' <- transExp (vdec_init v)
   (tenv, venv, b, lvl) <- ask
   case vdec_typ v of
     Just (sym, pos) ->
-      -- case getVarTy sym venv of
       case S.get sym tenv of
         Just ty ->
           if ty /= expty_ty exp' then
@@ -410,12 +431,11 @@ transDec (VarDec v) = do
     Nothing -> if isNil (expty_ty exp') then
                  raise "missing record type annotation" (vdec_pos v)
                else return ()
-  let access = allocLocal lvl True
+  let (access, lvl') = allocLocal lvl True
   let ventry = VEntry { ventry_access = access,
                         ventry_ty = expty_ty exp' }
-  return (tenv, add (vdec_name v) (VarEntry ventry) venv, b, lvl)
+  return (tenv, add (vdec_name v) (VarEntry ventry) venv, b, lvl')
 
--- Who knows if this works at all
 transDec (TypeDec tydecs) =
   if not $ nub (map tydec_name tydecs) == (map tydec_name tydecs) then
     raise "duplicate type declarations in the same let batch"
@@ -465,14 +485,14 @@ traceCycle _ _ _ = False
 transTy :: A.Ty -> TransM Ty b
 transTy (A.NameTy sym pos) = getTy sym pos
 transTy (A.RecordTy fields) = do
-  (tyId, _) <- nextNum
+  TransState (tyId, _) <- nextNum
   fields' <- mapM f fields
   return (RecordTy fields' tyId)
     where f fld = do
             ty <- getTy (field_typ fld) (field_pos fld)
             return ((field_name fld), ty)
 transTy (A.ArrayTy sym pos) = do
-  (tyId, _) <- nextNum
+  TransState (tyId, _) <- nextNum
   ty <- getTy sym pos
   return (ArrayTy ty tyId)
 
@@ -486,8 +506,12 @@ transProg p = transExp p
 -- Run the translation computation
 
 initContext :: Frame b => Context b
-initContext = (base_tenv, base_venv, Nothing, T.outermost)
+-- initContext = (base_tenv, base_venv, Nothing, T.outermost)
+initContext = (base_tenv, base_venv, Nothing,
+               newLevel T.outermost (namedLabel "main") [])
 
-runTrans :: Frame b => TransM a b -> Either String a
-runTrans t = fst $ runIdentity (runStateT (runExceptT (runReaderT t
-                                                        initContext)) 0)
+runTrans :: Frame b => TransM a b -> (Either String a, [Frag b])
+runTrans t =
+  let (res, st) = runIdentity (runStateT (runExceptT (runReaderT t
+                                                      initContext)) 0) in
+    (res, fragsOfTransState st)

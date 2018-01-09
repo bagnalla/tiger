@@ -2,15 +2,15 @@
 
 module Translate (
   Access, Exp, Level, allocLocal, dummyExp, formals, newLevel, outermost,
-  transArray, transAssign, transBreak, transCall, transFieldVar, transFor,
-  transIf, transInt, transNil, transOp, transRecord, transSeq,
+  transArray, transAssign, transBreak, transCall, transFrags, transFieldVar,
+  transFor, transIf, transInt, transNil, transOp, transRecord, transSeq,
   transSimpleVar, transString, transSubscriptVar, transWhile
   ) where
 
 import           Control.Monad.State
 
 import           Absyn (Oper(..))
-import           Frame (Frame, name, newFrame)
+import           Frame (Frag(..), Frame, name, newFrame)
 import qualified Frame as F (Access, allocLocal, exp, externalCall,
                              formals, fp, wordSize)
 import           Temp (Label, namedLabel, newLabel, newTemp)
@@ -34,7 +34,8 @@ dummyExp = Ex (T.EConst 0)
 seqstm :: [Stm] -> Stm
 seqstm (x : y : _ : xs) = SSeq x (seqstm (y : xs))
 seqstm (x : y : _) = SSeq x y
-seqstm _ = error "seqstm: requires at least two Stms"
+seqstm [x] = x
+seqstm _ = error "seqstm: requires at least one Stm"
 
 -- Convert Exp to T.Exp
 unEx :: (Num s, Show s, MonadState s m) => Exp -> m T.Exp
@@ -57,15 +58,9 @@ unEx (Cx genstm) = do
 
 -- Convert Exp to T.Stm
 unNx :: (Num s, Show s, MonadState s m) => Exp -> m Stm
-unNx (Ex (T.ESeq stm _)) = return stm
-unNx (Ex _) = error "unNx: bad Exp argument"
+unNx (Ex e) = return (SExp e)
 unNx (Nx stm) = return stm
--- unNx (Cx genstm) = do
---   e <- unEx (Cx genstm)
---   return $ T.SExp e
-unNx (Cx genstm) = do
-  -- e <- unEx (Cx genstm)
-  return SExp <*> unEx (Cx genstm) -- applicative style
+unNx (Cx genstm) = return SExp <*> unEx (Cx genstm)
 
 -- Convert Exp to a "genstm", a function from two labels to a
 -- statement that jumps to one of them.
@@ -114,8 +109,6 @@ levelOfAccess (Access lvl _) = lvl
 outermost :: Frame a => Level a
 outermost = LOutermost
 
--- TODO: maybe change this to take a single record argument as is done
--- the book
 newLevel :: Frame a =>
   -- Int     -> -- unique id
   Level a -> -- parent
@@ -133,11 +126,12 @@ formals lvl@(Level _ frame) =
   -- link.
   [Access lvl x | x <- tail (F.formals frame)]
 
-allocLocal :: Frame a => Level a -> Bool -> Access a
+allocLocal :: Frame a => Level a -> Bool -> (Access a, Level a)
 allocLocal lvl b =
-  let frame = frameOfLevel lvl
-      acc   = F.allocLocal frame b in
-    Access lvl acc
+  let frame         = frameOfLevel lvl
+      parent        = parentOfLevel lvl
+      (acc, frame') = F.allocLocal frame b in
+    (Access lvl acc, (Level parent frame'))
 
 -----------------------
 -- Tree IR translation.
@@ -351,6 +345,7 @@ transArray lvl init size = do
 
 ---------
 -- While
+
 transWhile :: (Num s, Show s, MonadState s m) =>
   Label -> Exp -> Exp -> m Exp
 transWhile done_lbl test body = do
@@ -416,6 +411,18 @@ transSeq es = do
 --------------
 -- Assignment
 
--- TODO
 transAssign :: (Num s, Show s, MonadState s m) => Exp -> Exp -> m Exp
-transAssign dst src = transAssign dst src
+transAssign dst src =
+  -- Why not be a little weird
+  (return Nx) `ap` (return SMove `ap` unEx dst `ap` unEx src)
+
+--------------------
+-- Create fragments
+
+transFrags :: (Num s, Show s, MonadState s m, Frame a) =>
+  [(Exp, Level a)] -> m [Frag a]
+transFrags bodies_levels =
+  mapM (\(body, lvl) -> do
+           stm <- unNx body
+           return $ FProc stm (frameOfLevel lvl))
+  bodies_levels

@@ -32,15 +32,15 @@ main = do
     Right p ->
       
       -- Here we specify the machine frame module with a type annotation.
-      let trans = transProg p :: TransM ExpTy X64Frame in
-        
-        case runTrans trans of
+      let trans = transProg p :: TransM ExpTy X64Frame
+          (main, frags) = runTrans trans in
+        case main of
           Left s -> putStrLn s
           Right p' ->
             let p'' = ExpTy { expty_exp = expty_exp p',
                               expty_ty = approxTy 1 (expty_ty p') } in
-              -- putStrLn (show p'') >>
-              return ()
+              putStrLn (show p'') >> putStrLn (show frags)
+              -- return ()
 
   -- ty <- test ()
   -- putStrLn (show (approxTy 50 ty))
