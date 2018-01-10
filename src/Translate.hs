@@ -2,15 +2,16 @@
 
 module Translate (
   Access, Exp, Level, allocLocal, dummyExp, formals, newLevel, outermost,
-  transArray, transAssign, transBreak, transCall, transFrags, transFieldVar,
-  transFor, transIf, transInt, transNil, transOp, transRecord, transSeq,
-  transSimpleVar, transString, transSubscriptVar, transWhile
+  transArray, transAssign, transBreak, transCall, transFrag, transFieldVar,
+  transFor, transIf, transInit, transInt, transLet, transNil, transOp,
+  transRecord, transSeq, transSimpleVar, transString, transSubscriptVar,
+  transWhile
   ) where
 
 import           Control.Monad.State
 
 import           Absyn (Oper(..))
-import           Frame (Frag(..), Frame, name, newFrame)
+import           Frame (Frag(..), Frame, name, newFrame, procEntryExit1)
 import qualified Frame as F (Access, allocLocal, exp, externalCall,
                              formals, fp, wordSize)
 import           Temp (Label, namedLabel, newLabel, newTemp)
@@ -43,7 +44,7 @@ unEx (Ex exp) = return exp
 unEx (Nx (SExp e)) = return e
 -- unEx (Nx (T.SMove (e1, e2))) = return e2
 -- unEx (Nx (T.SJump e _)) = return e
-unEx (Nx _) = error "unEx: bad Stm argument"
+unEx a@(Nx _) = error ("unEx: bad Stm argument: " ++ show a)
 unEx (Cx genstm) = do
   t <- newTemp ()
   t_lbl <- newLabel ()
@@ -92,11 +93,6 @@ parentOfLevel :: Level a -> Level a
 parentOfLevel (Level l _) = l
 parentOfLevel _ = error "parentOfLevel: outermost level has no parent"
 
--- Level plus a machine-specific Access
--- data Access a where
---   -- Access :: Frame a => Level a -> F.Access a -> Access a
---     Access :: Level a -> F.Access a -> Access a
-
 -- This might not need a class constraint for the type system to
 -- enforce our invariant. In order for "F.Access a" to typecheck, 'a'
 -- must be an instance of Frame.
@@ -106,11 +102,13 @@ data Access a =
 levelOfAccess :: Access a -> Level a
 levelOfAccess (Access lvl _) = lvl
 
+frameAccessOfAccess :: Access a -> F.Access a
+frameAccessOfAccess (Access _ a) = a
+
 outermost :: Frame a => Level a
 outermost = LOutermost
 
 newLevel :: Frame a =>
-  -- Int     -> -- unique id
   Level a -> -- parent
   Label   -> -- name
   [Bool]  -> -- formals
@@ -122,16 +120,21 @@ newLevel lvl lbl formals =
 
 formals :: Frame a => Level a -> [Access a]
 formals lvl@(Level _ frame) =
-  -- Be sure not to return the first formal because it's the static
-  -- link.
+  -- Don't return the first formal because it's the static link.
   [Access lvl x | x <- tail (F.formals frame)]
 
 allocLocal :: Frame a => Level a -> Bool -> (Access a, Level a)
 allocLocal lvl b =
   let frame         = frameOfLevel lvl
       parent        = parentOfLevel lvl
-      (acc, frame') = F.allocLocal frame b in
-    (Access lvl acc, (Level parent frame'))
+      (acc, frame') = F.allocLocal frame b
+      lvl' = Level parent frame' in
+    (Access lvl' acc, lvl')
+    -- TODO: this might be a problem.. The level associated with the
+    -- access needs to be retroactively updated when the level is
+    -- update. Or does it? Only numlocals changes. So far the only
+    -- place the level of an access is used is in transFor, and it
+    -- doesn't matter there.
 
 -----------------------
 -- Tree IR translation.
@@ -200,10 +203,11 @@ transInt :: Int -> Exp
 transInt i = Ex (T.EConst i)
 
 -- TODO: also return fragment
-transString :: (Num s, Show s, MonadState s m) => String -> m Exp
+transString :: (Num s, Show s, MonadState s m, Frame a) =>
+  String -> m (Exp, Frag a)
 transString s = do
   lbl <- newLabel ()
-  return $ Ex (T.EName lbl)
+  return $ (Ex (T.EName lbl), FString lbl s)
 
 -------------------
 -- Binops / Relops
@@ -404,6 +408,7 @@ transCall f es lvlDec lvlUse = do
 -- Sequences
 
 transSeq :: (Num s, Show s, MonadState s m) => [Exp] -> m Exp
+transSeq [] = return . Nx $ SExp (T.EConst 0)
 transSeq es = do
   es' <- mapM unNx es
   return . Nx $ seqstm es'
@@ -416,13 +421,47 @@ transAssign dst src =
   -- Why not be a little weird
   (return Nx) `ap` (return SMove `ap` unEx dst `ap` unEx src)
 
---------------------
--- Create fragments
+-----------------------------
+-- Create function fragments
 
-transFrags :: (Num s, Show s, MonadState s m, Frame a) =>
-  [(Exp, Level a)] -> m [Frag a]
-transFrags bodies_levels =
-  mapM (\(body, lvl) -> do
-           stm <- unNx body
-           return $ FProc stm (frameOfLevel lvl))
-  bodies_levels
+-- transFrags :: (Num s, Show s, MonadState s m, Frame a) =>
+--   [(Exp, Level a)] -> m [Frag a]
+-- transFrags bodies_levels =
+--   mapM (\(body, lvl) -> do
+--            stm <- unNx body
+--            let stm' = procEntryExit1 (frameOfLevel lvl) stm
+--            return $ FProc stm' (frameOfLevel lvl))
+--   bodies_levels
+
+transFrag :: (Num s, Show s, MonadState s m, Frame a) =>
+  Exp -> Level a -> m (Frag a)
+transFrag body lvl = do
+  stm <- unNx body
+  let stm' = procEntryExit1 (frameOfLevel lvl) stm
+  return $ FProc stm' (frameOfLevel lvl)
+
+-------------------------
+-- Initialize a variable
+
+transInit :: (Num s, Show s, MonadState s m, Frame a) =>
+  Access a -> Exp -> m Exp
+transInit access init_exp =
+  let lvl          = levelOfAccess access
+      frame        = frameOfLevel lvl
+      f_access     = frameAccessOfAccess access
+      f_access_exp = Ex (F.exp frame f_access (T.ETemp (F.fp frame))) in
+    transAssign f_access_exp init_exp
+
+---------------------------------------------------------
+-- Prepend variable initializations to a body expression
+
+transLet :: (Num s, Show s, MonadState s m) => [Exp] -> Exp -> m Exp
+transLet [] body = return body
+transLet binds body = do
+  binds' <- mapM unNx binds
+  case body of
+    Nx stm -> do
+      return . Nx $ seqstm (binds' ++ [stm])
+    _ -> do
+      exp <- unEx body
+      return . Ex $ T.ESeq (seqstm binds') exp

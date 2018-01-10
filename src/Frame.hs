@@ -27,7 +27,10 @@ class Frame a where
   -- rather than requiring a frame to be passed in merely for instance
   -- resolution...
   fp         :: a -> Temp
+  rv         :: a -> Temp
   wordSize   :: a -> Int
   exp        :: a -> Access a -> Exp -> Exp
   
   externalCall :: a -> String -> [Exp] -> Exp
+
+  procEntryExit1 :: a -> Stm -> Stm

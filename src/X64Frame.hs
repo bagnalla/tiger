@@ -7,7 +7,7 @@ module X64Frame (
 
 import Frame (Frame(..))
 import Temp (Label(..), namedLabel, tempConst)
-import Tree (Binop(..), Exp(..))
+import Tree (Binop(..), Exp(..), Stm(..))
 
 data X64Access =
   X64InFrame Int
@@ -41,6 +41,7 @@ x64ViewShift = [X64Push (X64InReg "bp"),
                 X64Mov  (X64InReg "sp") (X64InReg "bp")]
 
 x64fp = tempConst "fp"
+x64rv = tempConst "rv"
 
 x64WordSize = 8
 
@@ -72,6 +73,9 @@ x64NewFrame lbl bs =
              x64frame_numlocals = 0,
              x64frame_label     = lbl }
 
+x64ProcEntryExit1 :: X64Frame -> Stm -> Stm
+x64ProcEntryExit1 f s = s
+
 instance Frame X64Frame where
   type Access X64Frame = X64Access
 
@@ -80,8 +84,10 @@ instance Frame X64Frame where
   formals        = x64frame_formals
   allocLocal     = x64AllocLocal
   fp _           = x64fp
+  rv _           = x64rv
   wordSize _     = x64WordSize
   exp a          = x64Exp
 
   externalCall _ = x64ExternalCall
 
+  procEntryExit1 a = x64ProcEntryExit1 a

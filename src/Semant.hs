@@ -1,10 +1,7 @@
 {-# LANGUAGE FlexibleInstances #-}
 
 module Semant (
-  ExpTy(..),
-  runTrans,
-  TransM,
-  transProg
+  ExpTy(..), runTrans, TransM, transProg
   ) where
 
 import Control.Monad.Except
@@ -30,9 +27,9 @@ import           Temp (makeString, namedLabel, newLabel, Label)
 import qualified Translate as T (Exp, outermost, formals)
 import           Translate (Access, allocLocal, transFieldVar, Level,
                             newLevel, transArray, transAssign, transBreak,
-                            transCall, transFrags, transFieldVar, transFor,
-                            transIf, transInt, transNil, transOp,
-                            transRecord, transSeq, transSimpleVar,
+                            transCall, transFrag, transFieldVar, transFor,
+                            transIf, transInit, transInt, transLet, transNil,
+                            transOp, transRecord, transSeq, transSimpleVar,
                             transString, transSubscriptVar, transWhile)
 import           Types (fixTys, isNil, showTy, Ty(..))
 
@@ -176,8 +173,8 @@ transVar (SubscriptVar var i_exp pos) = do
                      expty_ty = ty }
     _ -> raise "expected array type" pos
 
------------------
--- Typecheck Exps
+--------------------------------
+-- Typecheck and translate Exps
 
 assertExpTy :: Frame b => Exp -> Ty -> Pos -> TransM ExpTy b
 assertExpTy exp ty pos = do
@@ -197,7 +194,9 @@ transExp (IntExp i) =
   return ExpTy { expty_exp = transInt i, expty_ty = IntTy }
 
 transExp (StringExp str pos) = do
-  exp <- transString str
+  (exp, frag) <- transString str
+  -- Add string fragment to state
+  modify (`mappend` (TransState (0, [frag])))
   return ExpTy { expty_exp = exp, expty_ty = StringTy }
 
 transExp (CallExp c) = do
@@ -324,10 +323,16 @@ transExp (BreakExp pos) = do
 
 transExp (LetExp l) = do
   ctx <- ask
-  ctx' <- foldM f ctx (let_decs l)
-  local (const ctx') (transExp (let_body l))
-  where f ctx dec =
-          local (const ctx) (transDec dec)
+  (ctx', inits) <- foldM f (ctx, []) (let_decs l)
+  local (const ctx')
+    (do exp <- transExp (let_body l)
+        -- Prepend variable initializations to the body expression
+        exp' <- transLet inits (expty_exp exp)
+        return $ ExpTy { expty_exp = exp', expty_ty = expty_ty exp })
+  where f (ctx, inits) dec =
+          local (const ctx)
+          (do (ctx', init) <- transDec dec
+              return (ctx', inits ++ init))
 
 transExp (ArrayExp a) = do
   ty <- getTy (array_typ a) (array_pos a)
@@ -345,10 +350,10 @@ transExp (ArrayExp a) = do
                        expty_ty = ArrayTy ty tyID }
     _ -> raise "expected array type" (array_pos a)
 
------------------
--- Typecheck Decs
+--------------------------------
+-- Typecheck and translate Decs
 
-transDec :: Frame b => Dec -> TransM (Context b) b
+transDec :: Frame b => Dec -> TransM (Context b, [T.Exp]) b
 
 -- Not 100% sure that the level stuff is done right here ("keeping track
 -- of levels" section at the end of chapter 6).
@@ -373,12 +378,12 @@ transDec (FunctionDec fundecs) =
       (mapM (\(f, lvl) -> h f lvl) (zip fundecs levels))
 
     -- Add fragments to state
-    frags <- transFrags (map (\(body, lvl) -> (expty_exp body, lvl))
-                          bodies_levels)
-    modify (\st -> foldr mappend st (map (\f -> TransState (0, [f])) frags))
+    frags <- mapM (\(body, lvl) -> transFrag body lvl)
+      (map (\(body, lvl) -> (expty_exp body, lvl)) bodies_levels)
+    modify (`mappend` (TransState (0, frags)))
            
     -- Return the extended context
-    return (tenv, venv', b, lvl)
+    return ((tenv, venv', b, lvl), [])
 
       -- Make header from a fundec
       where mkLevel lvl lbl fdec = do
@@ -434,7 +439,9 @@ transDec (VarDec v) = do
   let (access, lvl') = allocLocal lvl True
   let ventry = VEntry { ventry_access = access,
                         ventry_ty = expty_ty exp' }
-  return (tenv, add (vdec_name v) (VarEntry ventry) venv, b, lvl')
+  init <- transInit access (expty_exp exp')
+  return ((tenv, add (vdec_name v) (VarEntry ventry) venv, b, lvl'),
+           [init])
 
 transDec (TypeDec tydecs) =
   if not $ nub (map tydec_name tydecs) == (map tydec_name tydecs) then
@@ -453,7 +460,7 @@ transDec (TypeDec tydecs) =
           tys <- mapM g tydecs -- translate to Tys
           let tys' = fixTys (map fst headers) tys -- tie recursion with fix
           tenv' <- foldM h tenv (zip (map fst headers) tys') -- build new tenv
-          return (tenv', venv, b, lvl))
+          return ((tenv', venv, b, lvl), []))
       where
         f t = ((tydec_name t), NameTy (tydec_name t))
         g t = transTy (tydec_ty t)
@@ -496,22 +503,28 @@ transTy (A.ArrayTy sym pos) = do
   ty <- getTy sym pos
   return (ArrayTy ty tyId)
 
+
+-- The level of the main function
+mainLevel :: Frame a => Level a
+mainLevel = newLevel T.outermost (namedLabel "main") []
+
 ----------------------
 -- Translate a program
 
-transProg :: Frame b => Exp -> TransM ExpTy b
-transProg p = transExp p
+transProg :: Frame b => Exp -> TransM (Frag b) b
+transProg p = do
+  p' <- transExp p
+  transFrag (expty_exp p') mainLevel
 
 ----------------------------------
 -- Run the translation computation
 
 initContext :: Frame b => Context b
--- initContext = (base_tenv, base_venv, Nothing, T.outermost)
-initContext = (base_tenv, base_venv, Nothing,
-               newLevel T.outermost (namedLabel "main") [])
+initContext = (base_tenv, base_venv, Nothing, mainLevel)
 
 runTrans :: Frame b => TransM a b -> (Either String a, [Frag b])
 runTrans t =
   let (res, st) = runIdentity (runStateT (runExceptT (runReaderT t
                                                       initContext)) 0) in
     (res, fragsOfTransState st)
+  
