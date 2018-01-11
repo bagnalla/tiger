@@ -424,15 +424,6 @@ transAssign dst src =
 -----------------------------
 -- Create function fragments
 
--- transFrags :: (Num s, Show s, MonadState s m, Frame a) =>
---   [(Exp, Level a)] -> m [Frag a]
--- transFrags bodies_levels =
---   mapM (\(body, lvl) -> do
---            stm <- unNx body
---            let stm' = procEntryExit1 (frameOfLevel lvl) stm
---            return $ FProc stm' (frameOfLevel lvl))
---   bodies_levels
-
 transFrag :: (Num s, Show s, MonadState s m, Frame a) =>
   Exp -> Level a -> m (Frag a)
 transFrag body lvl = do
@@ -460,8 +451,7 @@ transLet [] body = return body
 transLet binds body = do
   binds' <- mapM unNx binds
   case body of
-    Nx stm -> do
-      return . Nx $ seqstm (binds' ++ [stm])
+    Nx stm -> return . Nx $ seqstm (binds' ++ [stm])
     _ -> do
       exp <- unEx body
       return . Ex $ T.ESeq (seqstm binds') exp

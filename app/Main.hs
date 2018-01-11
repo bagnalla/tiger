@@ -3,7 +3,7 @@ module Main where
 import System.Environment (getArgs)
 
 import Absyn(Exp(..))
-import Frame (Frag)
+import Frame (Frag(..))
 import X64Frame (X64Frame)
 import Parser (parseProg)
 import Semant (ExpTy(..), runTrans, TransM, transProg)
@@ -48,3 +48,10 @@ main = do
 
   -- ty <- test ()
   -- putStrLn (show (approxTy 50 ty))
+
+-- linearize_frags (frag : rest) =
+--   let rest' = linearize_frags rest
+--       frag' = case frag of
+--         FProc stm frame -> FProc (linearize stm) frame
+--         _ -> frag in
+--     frag' : rest'
