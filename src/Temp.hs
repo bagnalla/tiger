@@ -4,6 +4,8 @@ module Temp (
   namedLabel,
   newLabel,
   newTemp,
+  stringOfLabel,
+  stringOfTemp,
   tempConst,
   Temp
   ) where
@@ -14,7 +16,10 @@ import Gensym (nextNum)
 import Symtab (Id(..))
 
 data Temp = Temp String
-  deriving (Show)
+  deriving (Eq, Show)
+
+stringOfTemp :: Temp -> String
+stringOfTemp (Temp s) = s
 
 -- newTemp :: () -> Temp
 -- newTemp _ = Temp
@@ -32,6 +37,9 @@ makeString _ = ""
 
 data Label = Label String
   deriving (Eq, Show)
+
+stringOfLabel :: Label -> String
+stringOfLabel (Label s) = s
 
 newLabel :: (Num s, Show s, MonadState s m) => unit -> m Label
 newLabel _ = do

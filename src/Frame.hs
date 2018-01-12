@@ -3,8 +3,7 @@
 {-# LANGUAGE TypeFamilies #-}
 
 module Frame (
-  Frag(..),
-  Frame(..)
+  Frag(..), Frame(..), isFProc, stmOfFrag
   ) where
 
 import Temp (Label, Temp)
@@ -14,6 +13,14 @@ data Frag a where
   FProc   :: Frame a => Stm -> a -> Frag a
   FString :: Label -> String -> Frag a
 deriving instance Show a => Show (Frag a)
+
+stmOfFrag :: Frag a -> Stm
+stmOfFrag (FProc stm _) = stm
+stmOfFrag _ = error "stmOfFrag: not FProc"
+
+isFProc :: Frag a -> Bool
+isFProc (FProc _ _) = True
+isFProc _           = False
 
 class Frame a where
   type Access a :: *

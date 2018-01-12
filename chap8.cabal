@@ -21,6 +21,7 @@ library
   hs-source-dirs:      src
   exposed-modules:     Absyn, Env, Canon, Frame, Gensym, Lexer, Parser,
                        Symtab, Semant, Temp, Token, Translate, Tree,
+                       Sexp
                        Types, X64Frame
   build-depends:       base >= 4.7 && < 5
                      , containers

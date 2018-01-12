@@ -2,13 +2,14 @@ module Main where
 
 import System.Environment (getArgs)
 
-import Absyn(Exp(..))
-import Frame (Frag(..))
+import Absyn (Exp(..))
+import Canon (linearize, runLinearize)
+import Frame (Frag(..), isFProc, stmOfFrag)
 import X64Frame (X64Frame)
 import Parser (parseProg)
 import Semant (ExpTy(..), runTrans, TransM, transProg)
-
 import Types (approxTy, test)
+import Sexp(Sexp(..), toSexp)
 
 main :: IO ()
 main = do
@@ -44,7 +45,12 @@ main = do
             --                   expty_ty = approxTy 1 (expty_ty p') } in
               -- putStrLn (show p'') >> putStrLn (show frags)
               -- return ()
-            putStrLn (show main) >> putStrLn (show frags)
+            let main' = runLinearize (linearize (stmOfFrag main))
+                funs = map (\frag -> runLinearize (linearize (stmOfFrag frag)))
+                  (filter isFProc frags)
+            in
+              -- putStrLn (show main) >> putStrLn (show frags)
+              putStrLn (show (toSexp (main' : funs)))
 
   -- ty <- test ()
   -- putStrLn (show (approxTy 50 ty))
@@ -55,3 +61,4 @@ main = do
 --         FProc stm frame -> FProc (linearize stm) frame
 --         _ -> frag in
 --     frag' : rest'
+  
