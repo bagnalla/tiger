@@ -36,7 +36,7 @@ makeString :: Temp -> String
 makeString _ = ""
 
 data Label = Label String
-  deriving (Eq, Show)
+  deriving (Eq, Ord, Show)
 
 stringOfLabel :: Label -> String
 stringOfLabel (Label s) = s

@@ -9,9 +9,9 @@ module Symtab (
   get,
   exists,
   keys,
-  fold,
-  Symtab.map,
-  mapi
+  fold, -- foldRWithKey
+  -- Symtab.map, -- Is this necessary? Surely Map is a Functor.
+  mapi -- mapWithKey
   ) where
 
 -- Use Haskell's map data structure
@@ -34,6 +34,9 @@ add k = Map.insert k
 get :: Id -> Symtab a -> Maybe a
 get = Map.lookup
 
+-- all :: (a -> Bool) -> Symtab a -> Bool
+-- all pred = fold (\_ x acc -> pred x && acc) True
+
 -- Check if an Id is bound in a Symtab
 exists :: Id -> Symtab a -> Bool
 exists = Map.member
@@ -43,8 +46,10 @@ keys :: Symtab a -> [Id]
 keys = Map.keys
 
 -- Fold over all key/value pairs
-fold :: (a -> Id -> b -> a) -> a -> Symtab b -> a
-fold = Map.foldlWithKey
+-- fold :: (a -> Id -> b -> a) -> a -> Symtab b -> a
+-- fold = Map.foldlWithKey
+fold :: (Id -> a -> b -> b) -> b -> Symtab a -> b
+fold = Map.foldrWithKey
 
 -- Map values
 map :: (a -> b) -> Symtab a -> Symtab b

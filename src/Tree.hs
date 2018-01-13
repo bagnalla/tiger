@@ -5,7 +5,8 @@ module Tree (
   Binop(..),
   Exp(..),
   Relop(..),
-  Stm(..)
+  Stm(..),
+  negateRelop
   ) where
 
 import Temp (Label, stringOfLabel, stringOfTemp, Temp)
@@ -53,6 +54,18 @@ data Relop =
   | RUGt
   | RUGe
   deriving (Eq, Show)
+
+negateRelop :: Relop -> Relop
+negateRelop REq = RNe
+negateRelop RNe = REq
+negateRelop RLt = RGe
+negateRelop RGt = RLe
+negateRelop RLe = RGt
+negateRelop RGe = RLt
+negateRelop RULt = RUGe
+negateRelop RULe = RUGt
+negateRelop RUGt = RULe
+negateRelop RUGe = RULt
 
 ----------------------------------
 -- Sexp instances for Exp and Stm

@@ -3,7 +3,7 @@ module Main where
 import System.Environment (getArgs)
 
 import Absyn (Exp(..))
-import Canon (linearize, runLinearize)
+import Canon (basicBlocks, linearize, runCanon, traceSchedule)
 import Frame (Frag(..), isFProc, stmOfFrag)
 import X64Frame (X64Frame)
 import Parser (parseProg)
@@ -36,7 +36,7 @@ main = do
       -- Here we specify the machine frame module with a type annotation.
       -- let trans = transProg p :: TransM ExpTy X64Frame
       let trans = transProg p :: TransM (Frag X64Frame) X64Frame
-          (main, frags) = runTrans trans in
+          (main, frags, i) = runTrans trans in
         case main of
           Left s -> putStrLn "type error"
           -- Left s -> putStrLn s
@@ -45,20 +45,28 @@ main = do
             --                   expty_ty = approxTy 1 (expty_ty p') } in
               -- putStrLn (show p'') >> putStrLn (show frags)
               -- return ()
-            let main' = runLinearize (linearize (stmOfFrag main))
-                funs = map (\frag -> runLinearize (linearize (stmOfFrag frag)))
-                  (filter isFProc frags)
-            in
-              -- putStrLn (show main) >> putStrLn (show frags)
-              putStrLn (show (toSexp (main' : funs)))
+            let main_stm = stmOfFrag main
+                fun_stms = map stmOfFrag (filter isFProc frags)
+                ((main_linear, main_bb, main_flat,
+                 funs_linear, fun_bbs, funs_flat), i') = runCanon (
+                  do
+                    main_linear <- linearize main_stm
+                    (main_bb, main_exit) <- basicBlocks main_linear
+                    main_flat <- traceSchedule main_bb main_exit
+                    funs_linear <- mapM linearize fun_stms
+                    fun_bb_exits <- mapM basicBlocks funs_linear
+                    let (fun_bbs, fun_exits) = unzip fun_bb_exits
+                    funs_flat <- mapM (uncurry traceSchedule) fun_bb_exits
+                    return (main_linear, main_bb, main_flat,
+                            funs_linear, fun_bbs, funs_flat)
+                  ) i
+            in do
+              putStrLn ("Before linearizing:\n" ++
+                        show (toSexp (main_stm : fun_stms)))
+              putStrLn ("After linearizing:\n" ++
+                        show (toSexp (main_linear : funs_linear)))
+              putStrLn ("Basic blocks:\n" ++ show (toSexp (main_bb : fun_bbs)))
+              putStrLn ("After trace:\n" ++ show (toSexp (main_flat : funs_flat)))
 
   -- ty <- test ()
   -- putStrLn (show (approxTy 50 ty))
-
--- linearize_frags (frag : rest) =
---   let rest' = linearize_frags rest
---       frag' = case frag of
---         FProc stm frame -> FProc (linearize stm) frame
---         _ -> frag in
---     frag' : rest'
-  

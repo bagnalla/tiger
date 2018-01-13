@@ -33,7 +33,7 @@ dummyExp = Ex (T.EConst 0)
 
 -- Convenience function for building sequence Stms.
 seqstm :: [Stm] -> Stm
-seqstm (x : y : _ : xs) = SSeq x (seqstm (y : xs))
+seqstm (x : y : xs@(_:_)) = SSeq x (seqstm (y : xs))
 seqstm (x : y : _) = SSeq x y
 seqstm [x] = x
 seqstm _ = error "seqstm: requires at least one Stm"

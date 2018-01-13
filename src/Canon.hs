@@ -1,13 +1,38 @@
+-- The Block type is just [Stm] and CanonM is the state monad type.
+
 module Canon (
-  basicBlocks, CanonM, linearize, runLinearize, traceSchedule
+  CanonM, runCanon,
+
+  -- Stm -> CanonM [Stm]
+  -- Linearize a Stm, removing all SSeqs/ESeqs and making the direct
+  -- parent of every ECall is not also an ECall.
+  linearize,
+
+  -- [Stm] -> CanonM ([Block], Label)
+  -- Given a list of Stms produced from above, produce a list of basic
+  -- blocks and an 'exit' label that is jumped to at the end.
+  basicBlocks,
+
+  -- [Block] -> Label -> CanonM [Stm]
+  -- Given a list of basic blocks and 'exit' label produced from
+  -- above, arrange the blocks such that every SCJump is immediately
+  -- followed by its false label, and remove unnecessary SJumps where
+  -- possible. Produces a flattened list of statements as the final
+  -- result.
+  traceSchedule
   ) where
 
 import           Control.Monad.State
-import           Temp (Label, newLabel, newTemp)
-import           Tree (Exp(..), Stm(..))
+import           Data.Maybe (fromJust)
+import           Symtab (add, empty, fold, Id(..), Symtab)
+import qualified Symtab as S (get)
+import           Temp (Label, newLabel, newTemp, stringOfLabel)
+import           Tree (Exp(..), negateRelop, Stm(..))
 
 nop :: Stm
 nop = SExp (EConst 0)
+
+type CanonM = State Int
 
 -- Very conservative estimate of whether a statement and expression
 -- safely commute.
@@ -52,6 +77,9 @@ reorder [] =
   return (nop, [])
 
 do_stm :: (Num s, Show s, MonadState s m) => Stm -> m Stm
+do_stm (SMove (EMem e) (ECall f args)) =
+  reorder_stm (e : f : args)
+  (\es -> SMove (EMem (es!!0)) (ECall (es!!1) (drop 2 es)))
 -- Since reorder rewrites ECalls into moves to temporaries, when an
 -- ECall is already a direct subexpression of a SMove we avoid calling
 -- reorder on it and reorder its subexpressions directly instead.
@@ -89,13 +117,12 @@ do_exp (ESeq stm e) = do
   return (SSeq stm' stm'', e')
 do_exp e = return (nop, e)
 
-linearize :: (Num s, Show s, MonadState s m) => Stm -> m [Stm]
+linearize :: Stm -> CanonM [Stm]
 linearize stm = do
   stm' <- do_stm stm
-  stms <- linear stm' []
-  -- Remove nops. Might have to treat the case when the very last
-  -- statement is intended to be SExp (EConst 0) specially.
-  return $ filter (/= nop) stms
+  -- -- Remove nops. Might have to treat the case in which the very
+  -- -- last statement is intended to be (SExp (EConst 0)) specially.
+  return (filter (/= nop)) `ap` linear stm' []
   where linear (SSeq s1 s2) l = do
           l' <- linear s2 l
           linear s1 l'
@@ -116,12 +143,10 @@ linearize stm = do
 --       return $ FProc stm' frame
 --     _ -> return frag
 
-type CanonM = State Int
+type Block = [Stm]
+type Trace = [Block]
 
-runLinearize :: CanonM [Stm] -> [Stm]
-runLinearize l = evalState l 0
-
-basicBlocks :: [Stm] -> CanonM ([[Stm]], Label)
+basicBlocks :: [Stm] -> CanonM ([Block], Label)
 basicBlocks stms = do
   done <- newLabel ()
   blks <- blocks done stms [] []
@@ -150,7 +175,7 @@ basicBlocks stms = do
 
     -- Make sure a block starts with a label and ends with a
     -- jump/branch.
-    fix_block :: [Stm] -> Label -> CanonM [Stm]
+    fix_block :: Block -> Label -> CanonM Block
     fix_block blk lbl = do
       let s1 = head blk
           s2 = last blk
@@ -167,7 +192,7 @@ basicBlocks stms = do
     -- Fix blocks in reverse order so that the next block always
     -- starts with a label that we can jump to if the current block is
     -- missing a jump/branch at the end.
-    fix_blocks :: Label -> [[Stm]] -> CanonM [[Stm]]
+    fix_blocks :: Label -> [Block] -> CanonM [Block]
     fix_blocks done (blk : blks) = do
       blks' <- fix_blocks done blks
       if null blks' then do
@@ -178,6 +203,95 @@ basicBlocks stms = do
             lbl = labelOfStm next_lbl_stm
         blk' <- fix_block blk lbl
         return $ blk' : blks'
+    fix_blocks _ [] = return []
 
-traceSchedule :: [[Stm]] -> Label -> [Stm]
-traceSchedule _ _ = []
+-- Take a list of basic blocks and an 'exit' label, and turn them back
+-- into a big sequence of Stms but with every SCJump followed
+-- immediately by its false label and SJumps removed when possible.
+traceSchedule :: [Block] -> Label -> CanonM [Stm]
+traceSchedule blks exit_lbl = do
+  let tab = foldr (\blk acc ->
+                     add (toId (lblOfBlk blk)) blk acc)
+            empty blks
+      marked = fold (\id _ acc -> add id False acc)
+        (add (toId exit_lbl) True empty) tab
+      traces = build_traces tab marked []
+  -- Finishing touches...
+  stms <- finish (concat (concat traces) ++
+                   [SJump (EName exit_lbl) [exit_lbl]])
+  -- return stms
+  return (concat (concat traces))
+  where
+    lblOf stm =
+      case stm of
+        SLabel lbl -> lbl
+        _ -> error "traceSchedule: expected label at front of block"
+    lblOfBlk = lblOf . head 
+    toId lbl = Id (stringOfLabel lbl)
+
+    allMarked marked = fold (\_ x acc -> x && acc) True marked
+
+    -- Choose an unmarked block, returning its label.
+    select marked =
+      fromJust $ fold (\id b acc ->
+                         case acc of
+                           Nothing   -> if b then Nothing else Just id
+                           Just _    -> acc
+                      ) Nothing marked
+
+    -- Build traces until all blocks are marked.
+    build_traces :: Symtab Block -> Symtab Bool -> [Trace] -> [Trace]
+    build_traces tab marked accum =
+      if allMarked marked then
+        accum
+      else
+        let
+          blk = fromJust (S.get (select marked) tab)
+          (tr, marked') = build_trace blk tab marked in
+          build_traces tab marked' (tr : accum)
+
+    lblOfJump marked jmp =
+      case jmp of
+        SJump _ [lbl]      -> lbl
+        SCJump _ _ _ t f ->
+          if fromJust $ S.get (toId f) marked then t else f
+        _ -> error "traceSchedule: ill-formed jump"
+
+    -- Build a trace of unmarked blocks.
+    build_trace :: Block -> Symtab Block -> Symtab Bool -> (Trace, Symtab Bool)
+    build_trace blk tab marked =
+      let lbl  = toId (lblOfBlk blk)
+          lbl' = toId (lblOfJump marked (last blk))
+          marked' = add lbl True marked in
+        -- ([blk], marked')
+        if fromJust $ S.get lbl' marked' then
+          ([blk], marked')
+        else
+          let blk' = fromJust $ S.get lbl' tab
+              (blks, marked'') = build_trace blk' tab marked' in
+            (blk : blks, marked'')
+
+    finish (stm@(SCJump r e1 e2 t f) : next : stms) = do
+      stms' <- finish (next : stms)
+      let lbl = lblOf next
+      if lbl == t then
+        return $ SCJump (negateRelop r) e1 e2 f t : stms'
+        else if lbl /= f then do
+        f' <- newLabel ()
+        return $ SCJump r e1 e2 t f' : SLabel f' :
+          SJump (EName f) [f] : stms'
+        else
+        return $ stm : stms'
+    finish (SJump e [lbl1] : SLabel lbl2 : stms) =
+      if lbl1 == lbl2 then
+        finish stms
+      else do
+        stms' <- finish stms
+        return $ SJump e [lbl1] : SLabel lbl2 : stms'
+    finish (stm : stms) = pure (:) `ap` pure stm `ap` finish stms
+    finish [] = return []
+
+
+-- Run 
+runCanon :: CanonM a -> Int -> (a, Int)
+runCanon r i = runState r i

@@ -46,6 +46,7 @@ type Context b = (TypeEnv, ValueEnv b, Maybe Label, Level b)
 newtype TransState b = TransState (Int, [Frag b])
 
 fragsOfTransState (TransState (_, frags)) = frags
+intOfTransState (TransState (i, _)) = i
 
 -- Here we declare a Num instance for TransState, which allows us to
 -- treat a TransState as a number. It just uses the internal Int and
@@ -522,9 +523,8 @@ transProg p = do
 initContext :: Frame b => Context b
 initContext = (base_tenv, base_venv, Nothing, mainLevel)
 
-runTrans :: Frame b => TransM a b -> (Either String a, [Frag b])
+runTrans :: Frame b => TransM a b -> (Either String a, [Frag b], Int)
 runTrans t =
   let (res, st) = runIdentity (runStateT (runExceptT (runReaderT t
                                                       initContext)) 0) in
-    (res, fragsOfTransState st)
-  
+    (res, fragsOfTransState st, intOfTransState st)
