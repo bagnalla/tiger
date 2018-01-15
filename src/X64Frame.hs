@@ -2,11 +2,16 @@
 
 module X64Frame (
   Access,
-  X64Frame
+  X64Frame,
+  specialRegs,
+  argRegs,
+  calleeSaves,
+  callerSaves
   ) where
 
-import Frame (Frame(..))
-import Temp (Label(..), namedLabel, tempConst)
+import Assem (Instr(..), Oper(..))
+import Frame (Frame(..), Func(..))
+import Temp (Label(..), namedLabel, stringOfLabel, stringOfTemp, tempConst)
 import Tree (Binop(..), Exp(..), Stm(..))
 
 data X64Access =
@@ -14,6 +19,7 @@ data X64Access =
   | X64InReg String
   deriving (Show)
 
+-- Not sure if this type is even necessary.
 data X64Instr =
   X64Mov X64Access X64Access
   | X64Push X64Access
@@ -22,8 +28,10 @@ data X64Instr =
   | X64Jmp String
   | X64Ret
   | X64Leave
-  | X64Add Int X64Access
-  | X64Sub Int X64Access
+  | X64Addi Int X64Access
+  | X64Subi Int X64Access
+  | X64Mul X64Access
+  | X64Div X64Access
   | X64Nop
   deriving (Show)
 
@@ -37,11 +45,21 @@ data X64Frame =
 -- Save the current base pointer by pushing it onto the stack, then copy
 -- the stack pointer value into the base pointer. At this point, the stack
 -- pointer still needs to be decremented to allocate the activation frame.
-x64ViewShift = [X64Push (X64InReg "bp"),
-                X64Mov  (X64InReg "sp") (X64InReg "bp")]
+x64ViewShift = [X64Push (X64InReg "rbp"),
+                X64Mov  (X64InReg "rsp") (X64InReg "rbp")]
 
-x64fp = tempConst "fp"
-x64rv = tempConst "rv"
+-- Apparently rbp is not often used, but we will probably use it.
+x64fp = tempConst "rbp"
+x64sp = tempConst "rsp"
+x64rv = tempConst "rax"
+
+specialRegs = ["rbp", "rsp", "rax"]
+-- Apparently r10 is used for static links, so we put it first. The
+-- first 6 real arguments are passed in the following registers and
+-- the rest go on the stack (first argument topmost).
+argRegs = ["r10", "rdi", "rsi", "rdx", "rcx", "r8", "r9"]
+calleeSaves = ["rbx", "r12", "r13", "r14", "r15"] -- rbp
+callerSaves = ["r11"] -- rsp and argRegs
 
 x64WordSize = 8
 
@@ -74,7 +92,28 @@ x64NewFrame lbl bs =
              x64frame_label     = lbl }
 
 x64ProcEntryExit1 :: X64Frame -> Stm -> Stm
-x64ProcEntryExit1 f s = s
+x64ProcEntryExit1 frame stm = stm
+
+x64ProcEntryExit2 :: X64Frame -> [Instr] -> [Instr]
+x64ProcEntryExit2 frame instrs =
+  instrs ++ [IOper $ Oper { oper_assem = "",
+                            oper_dst   = [],
+                            oper_src   = [x64fp, x64sp, x64rv],
+                            oper_jump  = Just [] }]
+
+x64ProcEntryExit3 :: X64Frame -> [Instr] -> Func
+x64ProcEntryExit3 frame instrs =
+  Func { func_prolog = "PROCEDURE " ++
+                       stringOfLabel (x64frame_label frame) ++ "\n",
+         func_body   = instrs,
+         func_epilog = "END " ++
+                       stringOfLabel (x64frame_label frame) ++ "\n" }
+
+x64TempMap s =
+  if s `elem` specialRegs then
+    Just s
+  else
+    Nothing
 
 instance Frame X64Frame where
   type Access X64Frame = X64Access
@@ -90,4 +129,8 @@ instance Frame X64Frame where
 
   externalCall _ = x64ExternalCall
 
-  procEntryExit1 a = x64ProcEntryExit1 a
+  procEntryExit1 = x64ProcEntryExit1
+  procEntryExit2 = x64ProcEntryExit2
+  procEntryExit3 = x64ProcEntryExit3
+
+  tempMap _ = x64TempMap

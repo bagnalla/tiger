@@ -292,6 +292,9 @@ traceSchedule blks exit_lbl = do
     finish [] = return []
 
 
--- Run 
+-- Given an integer for the gensym seed (so we don't collide with
+-- symbols generated earlier in the compiler), run a CanonM
+-- computation, returning both the computation result and the modified
+-- gensym integer.
 runCanon :: CanonM a -> Int -> (a, Int)
 runCanon r i = runState r i

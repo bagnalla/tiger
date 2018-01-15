@@ -3,16 +3,24 @@
 {-# LANGUAGE TypeFamilies #-}
 
 module Frame (
-  Frag(..), Frame(..), isFProc, stmOfFrag
+  Frag(..), Frame(..), Func(..), isFProc, stmOfFrag
   ) where
 
+import Assem (Instr, Reg)
 import Temp (Label, Temp)
 import Tree (Exp, Stm)
+
+type Register = String
 
 data Frag a where
   FProc   :: Frame a => Stm -> a -> Frag a
   FString :: Label -> String -> Frag a
 deriving instance Show a => Show (Frag a)
+
+data Func = Func
+  { func_prolog :: String,
+    func_body   :: [Instr],
+    func_epilog :: String }
 
 stmOfFrag :: Frag a -> Stm
 stmOfFrag (FProc stm _) = stm
@@ -41,3 +49,12 @@ class Frame a where
   externalCall :: a -> String -> [Exp] -> Exp
 
   procEntryExit1 :: a -> Stm -> Stm
+
+  -- Append a 'sink' instruction to the end of the function body to
+  -- tell the register allocator that special registers are live
+  -- throughout the entire function.
+  procEntryExit2 :: a -> [Instr] -> [Instr]
+
+  procEntryExit3 :: a -> [Instr] -> Func
+
+  tempMap :: a -> Register -> Maybe Reg

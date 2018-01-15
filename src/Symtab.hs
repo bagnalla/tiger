@@ -6,7 +6,9 @@ module Symtab (
   Symtab,
   empty,
   add,
+  addS,
   get,
+  getS,
   exists,
   keys,
   fold, -- foldRWithKey
@@ -30,9 +32,14 @@ empty = Map.empty
 -- Add a binding to a Symtab
 add k = Map.insert k
 
+addS = add . Id
+
 -- Get the value bound to an Id
 get :: Id -> Symtab a -> Maybe a
 get = Map.lookup
+
+getS :: String -> Symtab a -> Maybe a
+getS = get . Id
 
 -- all :: (a -> Bool) -> Symtab a -> Bool
 -- all pred = fold (\_ x acc -> pred x && acc) True
